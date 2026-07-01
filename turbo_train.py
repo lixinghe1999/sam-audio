@@ -26,14 +26,11 @@ Usage:
 from __future__ import annotations
 
 import argparse
-import copy
 import os
 import time
-from typing import Any
 
 import torch
 import torch.nn as nn
-from torch.cuda.amp import autocast
 from torch.utils.data import DataLoader
 
 from sam_audio import SAMAudio, SAMAudioProcessor
@@ -42,12 +39,10 @@ from sam_audio.train import (
     freeze_encoders,
     strip_vision_branch,
 )
-from sam_audio.turbo.sampler import teacher_ode_sample
 from sam_audio.turbo.consistency import (
     EMAHelper,
     cd_intervals,
     consistency_loss,
-    flow_interpolate,
     _make_vf_fn,
 )
 
@@ -75,10 +70,9 @@ def turbo_train(
         student: Trainable student SAM-Audio (may be PeftModel).
         processor: SAMAudioProcessor for batch encoding.
         dataloader: DataLoader yielding ``(audios, descriptions)`` tuples.
-        teacher: Frozen teacher SAM-Audio.  When ``None`` (LoRA mode),
-            ``student.base_model`` is used as the teacher — both share
-            the same pretrained weights, saving one full model copy of
-            GPU memory.
+        teacher: Frozen teacher SAM-Audio. When ``None`` (LoRA mode), the
+            student's adapters are disabled for teacher calls, so the frozen
+            pretrained base supplies the teacher without a second model copy.
         num_steps: Number of CD intervals (1 / 2 / 4).
         epochs: Training epochs.
         lr: Learning rate for student (single optimizer, no discriminator).
@@ -88,6 +82,11 @@ def turbo_train(
         log_every: Log metrics every N steps.
     """
     # ── freeze teacher ──────────────────────────────────────────────
+    device = torch.device(device)
+    amp_enabled = device.type == "cuda"
+    if num_steps < 1:
+        raise ValueError(f"num_steps must be positive, got {num_steps}")
+
     if teacher is not None:
         teacher.eval()
         teacher.to(device)
@@ -99,16 +98,45 @@ def turbo_train(
     student.train()
     freeze_encoders(student)
 
+    # These modules only build forward_args and are never traversed by the
+    # student's vector-field forward. Freeze them explicitly; eval() alone
+    # does not clear requires_grad. With a separate teacher, its encoders build
+    # the conditioning, so the duplicate student copies can stay on CPU.
+    student_base = getattr(student, "base_model", student)
+    for encoder_name in ("audio_codec", "text_encoder", "vision_encoder"):
+        encoder = getattr(student_base, encoder_name, None)
+        if encoder is None:
+            continue
+        encoder.eval()
+        for param in encoder.parameters():
+            param.requires_grad_(False)
+        if teacher is not None:
+            encoder.to("cpu")
+
     # ── derive teacher from student.base_model when not explicitly provided ──
+    shared_lora_teacher = teacher is None
     if teacher is None:
-        teacher = getattr(student, "base_model", student)
-        teacher.eval()
+        if not hasattr(student, "disable_adapter"):
+            raise ValueError(
+                "teacher=None is only supported for adapter training; pass a "
+                "separate frozen teacher for full-weight distillation"
+            )
+        teacher = student
 
     # ── EMA student (shadow weights, no optimizer) ──────────────────
-    ema = EMAHelper(student.parameters(), decay=ema_decay)
+    trainable_named = [
+        (name, param)
+        for name, param in student.named_parameters()
+        if param.requires_grad
+    ]
+    if not trainable_named:
+        raise ValueError("student has no trainable parameters")
+    ema = EMAHelper(trainable_named, decay=ema_decay)
 
     # ── optimizer (single, no discriminator) ────────────────────────
-    optimizer = torch.optim.AdamW(student.parameters(), lr=lr, betas=(0.5, 0.9))
+    optimizer = torch.optim.AdamW(
+        [param for _, param in trainable_named], lr=lr, betas=(0.5, 0.9)
+    )
 
     # ── stats ───────────────────────────────────────────────────────
     trainable = sum(p.numel() for p in student.parameters() if p.requires_grad)
@@ -131,13 +159,17 @@ def turbo_train(
 
             base_t = getattr(teacher, "base_model", teacher)
 
-            with torch.no_grad(), autocast(
-                dtype=torch.bfloat16, enabled=(device != "cpu")
+            with torch.no_grad(), torch.autocast(
+                device_type=device.type,
+                dtype=torch.bfloat16,
+                enabled=amp_enabled,
             ):
                 forward_args = base_t._get_forward_args(batch)
+            # The encoded tensors in forward_args are all that the ODE needs;
+            # release the much larger waveform batch before model forwards.
+            del batch
 
             audio_features = forward_args["audio_features"]  # z_0: clean latent
-            B, T, C = audio_features.shape
             z_1 = torch.randn_like(audio_features)  # noise
 
             # --- sample a CD interval ---
@@ -146,19 +178,24 @@ def turbo_train(
             t, s = intervals[torch.randint(len(intervals), ()).item()]
 
             # --- teacher ODE segment (t → s, no grad) ---
-            teacher_vf = _make_vf_fn(teacher, forward_args)
-            with torch.no_grad(), autocast(
-                dtype=torch.bfloat16, enabled=(device != "cpu")
-            ):
-                x_t = flow_interpolate(audio_features, z_1, t)
+            teacher_vf = _make_vf_fn(
+                teacher,
+                forward_args,
+                disable_adapters=shared_lora_teacher,
+                force_eval=shared_lora_teacher,
+            )
 
             # === Consistency loss ===
-            with autocast(dtype=torch.bfloat16, enabled=(device != "cpu")):
-                ema_model = ema.ema_model(student)
-                loss, x0_stu, _ = consistency_loss(
+            optimizer.zero_grad(set_to_none=True)
+            with torch.autocast(
+                device_type=device.type,
+                dtype=torch.bfloat16,
+                enabled=amp_enabled,
+            ):
+                loss, _, _ = consistency_loss(
                     teacher_vf=teacher_vf,
                     student=student,
-                    ema_model=ema_model,
+                    ema_model=ema,
                     z_0=audio_features,
                     z_1=z_1,
                     forward_args=forward_args,
@@ -167,12 +204,11 @@ def turbo_train(
                     loss_fn="huber",
                 )
 
-            optimizer.zero_grad()
             loss.backward()
             optimizer.step()
 
             # --- update EMA ---
-            ema.update(list(student.parameters()))
+            ema.update()
 
             # --- logging ---
             losses_cd.append(loss.item())
@@ -185,6 +221,8 @@ def turbo_train(
 
         # --- epoch summary ---
         elapsed = time.time() - epoch_start
+        if not losses_cd:
+            raise ValueError("dataloader produced no batches")
         avg_loss = sum(losses_cd) / len(losses_cd)
         print(
             f"Epoch {epoch + 1:3d} | "
@@ -198,14 +236,14 @@ def turbo_train(
             student.save_pretrained(ckpt_path)
         else:
             os.makedirs(ckpt_path, exist_ok=True)
-            state = {
-                "model": student.state_dict(),
-                "ema": ema.state_dict(),
-                "optimizer": optimizer.state_dict(),
-                "epoch": epoch + 1,
-                "num_steps": num_steps,
-            }
-            torch.save(state, f"{ckpt_path}/checkpoint.pt")
+            torch.save(student.state_dict(), f"{ckpt_path}/model.pt")
+        state = {
+            "ema": ema.state_dict(),
+            "optimizer": optimizer.state_dict(),
+            "epoch": epoch + 1,
+            "num_steps": num_steps,
+        }
+        torch.save(state, f"{ckpt_path}/training_state.pt")
         print(f"  -> saved checkpoint to {ckpt_path}")
 
     return student
@@ -244,6 +282,7 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     device = args.device if torch.cuda.is_available() else "cpu"
+    model_dtype = torch.bfloat16 if device != "cpu" else torch.float32
     print(f"Device: {device}")
     print(f"Mode: {'LoRA' if args.use_lora else 'full-weight'} CD")
 
@@ -251,7 +290,7 @@ if __name__ == "__main__":
     teacher = None
     if args.use_lora:
         student = SAMAudio.from_pretrained(args.model_id)
-        student = student.to(torch.bfloat16)
+        student = student.to(model_dtype)
         strip_vision_branch(student)
         student = apply_lora(student, rank=args.lora_rank, alpha=16)
         freeze_encoders(student)
@@ -263,11 +302,11 @@ if __name__ == "__main__":
         )
     else:
         teacher = SAMAudio.from_pretrained(args.model_id)
-        teacher = teacher.to(torch.bfloat16)
+        teacher = teacher.to(model_dtype)
         strip_vision_branch(teacher)
 
         student = SAMAudio.from_pretrained(args.model_id)
-        student = student.to(torch.bfloat16)
+        student = student.to(model_dtype)
         strip_vision_branch(student)
 
     # ── Processor ─────────────────────────────────────────────────────

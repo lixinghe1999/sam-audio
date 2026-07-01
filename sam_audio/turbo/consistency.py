@@ -4,7 +4,7 @@ Replaces DMD (teacher + student + discriminator) with CD
 (teacher + student + EMA) for lower memory and more stable training.
 
 Core idea:
-    A student predicts ``x_0`` (clean) from any noisy state ``x_t``.
+    A student predicts the clean endpoint from any noisy state ``x_t``.
     Teacher integrates from ``t`` to ``s`` along the ODE trajectory.
     Student from ``x_t`` and EMA from ``x_s`` must predict the same ``x_0``.
 
@@ -17,6 +17,7 @@ References:
 from __future__ import annotations
 
 import copy
+from contextlib import nullcontext
 from typing import Any, Callable
 
 import torch
@@ -29,16 +30,18 @@ from torchdiffeq import odeint
 
 
 def cd_time_steps(num_steps: int = 4) -> list[float]:
-    """Linearly spaced time grid from noise (t=1) to clean (t=0).
+    """Linearly spaced time grid from noise (t=0) to clean (t=1).
 
-    For flow matching:  t=1 → full noise,  t=0 → clean data.
+    This is the convention used by :class:`SAMAudio`: inference integrates
+    its vector field from ``0`` to ``1``.
     """
-    return [1.0 - i / num_steps for i in range(num_steps + 1)]
-    # e.g. num_steps=4 → [1.0, 0.75, 0.5, 0.25, 0.0]
+    if num_steps < 1:
+        raise ValueError(f"num_steps must be positive, got {num_steps}")
+    return [i / num_steps for i in range(num_steps + 1)]
 
 
 def cd_intervals(num_steps: int = 4) -> list[tuple[float, float]]:
-    """Non-overlapping training intervals, each (noisier, cleaner)."""
+    """Non-overlapping ``(noisier, cleaner)`` training intervals."""
     steps = cd_time_steps(num_steps)
     return [(steps[i], steps[i + 1]) for i in range(num_steps)]
 
@@ -53,11 +56,12 @@ def velocity_to_clean(
 ) -> torch.Tensor:
     """Convert predicted velocity to clean estimate via flow matching.
 
-    Flow-matching ODE:  x_s = s * x_1 + (1 - s) * x_0
-    Vector field:       v = x_1 - x_0
-    Therefore:          x_0 = x_t - t * v           (exact identity)
+    SAM-Audio flow:  ``x_t = (1-t) * noise + t * clean``
+    Vector field:    ``v = clean - noise``
+    Therefore:       ``clean = x_t + (1-t) * v``.
     """
-    return x_t - t[:, None, None] * v_pred
+    scale = (1 - t).reshape((-1,) + (1,) * (x_t.ndim - 1))
+    return x_t + scale * v_pred
 
 
 def flow_interpolate(
@@ -65,7 +69,7 @@ def flow_interpolate(
     x_1: torch.Tensor,
     t: float | torch.Tensor,
 ) -> torch.Tensor:
-    """Straight-line flow interpolation:  x_t = t * x_1 + (1 - t) * x_0."""
+    """Interpolate from ``x_0`` at time 0 to ``x_1`` at time 1."""
     if isinstance(t, float):
         return t * x_1 + (1 - t) * x_0
     return t[:, None, None] * x_1 + (1 - t[:, None, None]) * x_0
@@ -133,14 +137,21 @@ class EMAHelper:
 
     def __init__(
         self,
-        params: nn.Parameter | list[nn.Parameter],
+        params,
         decay: float = 0.999,
     ):
         if isinstance(params, nn.Parameter):
             params = [params]
+        params = list(params)
+        if params and isinstance(params[0], tuple):
+            self.names = [name for name, _ in params]
+            self._params = [param for _, param in params]
+        else:
+            self.names = None
+            self._params = params
         self.decay = decay
         self.shadows: list[torch.Tensor] = []
-        for p in params:
+        for p in self._params:
             self.shadows.append(p.data.clone().detach())
         self._update_count = 0
         # Cached frozen model — set externally via set_frozen_model()
@@ -153,25 +164,63 @@ class EMAHelper:
         # Use true decay (warmup from 0 in first few steps)
         d = min(self.decay, (1 + self._update_count) / (10 + self._update_count))
 
-        for shadow, param in zip_ema(self.shadows, params):
-            shadow.data = d * shadow.data + (1 - d) * param.data
+        current = self._params if params is None else list(params)
+        if len(current) != len(self.shadows):
+            raise ValueError("EMA parameter count changed during training")
+        with torch.no_grad():
+            for shadow, param in zip(self.shadows, current):
+                shadow.lerp_(param.detach(), 1 - d)
 
     def state_dict(self) -> dict[str, Any]:
         return {
             "decay": self.decay,
+            "names": self.names,
             "shadows": self.shadows,
             "_update_count": self._update_count,
         }
 
     def load_state_dict(self, state: dict[str, Any]) -> None:
         self.decay = state["decay"]
-        self.shadows = state["shadows"]
+        self.names = state.get("names", self.names)
+        if len(state["shadows"]) != len(self._params):
+            raise ValueError("EMA checkpoint parameter count does not match model")
+        self.shadows = [
+            shadow.to(device=param.device, dtype=param.dtype)
+            for shadow, param in zip(state["shadows"], self._params)
+        ]
         self._update_count = state["_update_count"]
 
     def copy_to(self, model: nn.Module) -> None:
         """Copy shadow weights into model (for eval / checkpoint)."""
-        for shadow, param in zip_ema(self.shadows, model.parameters()):
+        if self.names is None:
+            params = list(model.parameters())
+        else:
+            named = dict(model.named_parameters())
+            params = [named[name] for name in self.names]
+        for shadow, param in zip(self.shadows, params):
             param.data.copy_(shadow.data)
+
+    def forward(self, model: nn.Module, **kwargs) -> torch.Tensor:
+        """Run an EMA-weighted forward without cloning or mutating ``model``.
+
+        Only the tracked parameters are substituted. Frozen base weights and
+        buffers are shared, which is especially important for LoRA training.
+        """
+        if self.names is None:
+            raise RuntimeError(
+                "EMAHelper.forward requires (name, parameter) pairs at construction"
+            )
+        from torch.func import functional_call
+
+        replacements = dict(zip(self.names, self.shadows))
+        training = [(module, module.training) for module in model.modules()]
+        model.eval()
+        try:
+            return functional_call(model, replacements, (), kwargs, strict=False)
+        finally:
+            # Restore each flag directly so nested frozen encoders remain frozen.
+            for module, was_training in training:
+                module.training = was_training
 
     def set_frozen_model(self, model: nn.Module) -> None:
         """Set a static copy of the student model for EMA weight loading.
@@ -238,32 +287,36 @@ class EMAHelper:
         return ema
 
 
-def zip_ema(shadows, params):
-    """Zip shadows and params, handling nested structures."""
-    if params is not None:
-        yield from zip(shadows, params)
-    else:
-        yield from zip(shadows, [])  # no-op
-
-
 # ── Consistency loss ────────────────────────────────────────────────
 
 
 def _make_vf_fn(
     model: nn.Module,
     forward_args: dict[str, Any],
+    *,
+    disable_adapters: bool = False,
+    force_eval: bool = False,
 ) -> Callable[[torch.Tensor, torch.Tensor], torch.Tensor]:
     """Wrap model forward as ``(t, z_t) → v`` for ODE integration."""
-    base = getattr(model, "base_model", model)
-
     def vf_fn(t: torch.Tensor, z_t: torch.Tensor) -> torch.Tensor:
         if t.ndim == 0:
             t = t.expand(z_t.size(0))
-        return base(
-            noisy_audio=z_t,
-            time=t,
-            **forward_args,
+        adapter_context = (
+            model.disable_adapter()
+            if disable_adapters and hasattr(model, "disable_adapter")
+            else nullcontext()
         )
+        training = None
+        if force_eval:
+            training = [(module, module.training) for module in model.modules()]
+            model.eval()
+        try:
+            with adapter_context:
+                return model(noisy_audio=z_t, time=t, **forward_args)
+        finally:
+            if training is not None:
+                for module, was_training in training:
+                    module.training = was_training
 
     return vf_fn
 
@@ -271,7 +324,7 @@ def _make_vf_fn(
 def consistency_loss(
     teacher_vf: Callable[[torch.Tensor, torch.Tensor], torch.Tensor],
     student: nn.Module,
-    ema_model: nn.Module,
+    ema_model: nn.Module | EMAHelper,
     z_0: torch.Tensor,
     z_1: torch.Tensor,
     forward_args: dict[str, Any],
@@ -288,8 +341,8 @@ def consistency_loss(
         z_0: Clean data ``[B, T, C]`` (audio_features).
         z_1: Noise ``[B, T, C]`` (randn_like(z_0)).
         forward_args: Conditioning forwarded to model.
-        t: Noisier time point (e.g. 1.0).
-        s: Cleaner time point (e.g. 0.75).  Must satisfy ``t > s``.
+        t: Noisier time point (e.g. 0.0).
+        s: Cleaner time point (e.g. 0.25). Must satisfy ``t < s``.
         loss_fn: ``"mse"``, ``"l1"``, or ``"huber"`` (default).
 
     Returns:
@@ -302,28 +355,27 @@ def consistency_loss(
     # 1. Construct x_t and x_s
     t_s = torch.full((B,), t, device=device)
     s_s = torch.full((B,), s, device=device)
-    x_t = flow_interpolate(z_0, z_1, t)   # [B, T, C], noisy
+    if not 0 <= t < s <= 1:
+        raise ValueError(f"expected 0 <= t < s <= 1, got t={t}, s={s}")
+    x_t = flow_interpolate(z_1, z_0, t)  # noise at 0, clean at 1
 
     # 2. Teacher integrates from t → s (no grad)
     with torch.no_grad():
         x_s = _teacher_ode_segment(teacher_vf, x_t, t_start=t, t_end=s)
 
-    # 3. Student predicts clean from x_t (with grad)
-    v_student = student(
-        noisy_audio=x_t,
-        time=t_s,
-        **forward_args,
-    )
-    x0_student = velocity_to_clean(x_t, t_s, v_student)
-
-    # 4. EMA predicts clean from x_s (no grad)
+    # 3. EMA predicts clean from x_s (no grad). Do this before the student
+    # forward so an implementation that swaps weights cannot invalidate its graph.
     with torch.no_grad():
-        v_ema = ema_model(
-            noisy_audio=x_s,
-            time=s_s,
-            **forward_args,
-        )
+        kwargs = dict(noisy_audio=x_s, time=s_s, **forward_args)
+        if isinstance(ema_model, EMAHelper):
+            v_ema = ema_model.forward(student, **kwargs)
+        else:
+            v_ema = ema_model(**kwargs)
         x0_target = velocity_to_clean(x_s, s_s, v_ema)
+
+    # 4. Student predicts clean from x_t (with grad)
+    v_student = student(noisy_audio=x_t, time=t_s, **forward_args)
+    x0_student = velocity_to_clean(x_t, t_s, v_student)
 
     # 5. Consistency distance
     if loss_fn == "mse":
@@ -349,7 +401,7 @@ def multistep_sample(
     """4-step consistency sampling for inference.
 
     Procedure:
-        1. Start from noise at t=1.
+        1. Start from noise at t=0.
         2. Predict clean:  x0_hat = f_theta(x_{k}, k).
         3. Re-noise to next interval:  x_{k_next} = k_next * noise + (1 - k_next) * x0_hat.
         4. Repeat until t=0.
@@ -371,14 +423,14 @@ def multistep_sample(
     if noise is None:
         noise = torch.randn_like(audio_features)
 
-    steps = cd_time_steps(num_steps)  # [1.0, ..., 0.0]
+    steps = cd_time_steps(num_steps)  # [0.0, ..., 1.0]
 
     # Start from full noise
-    z = noise  # x_{t=1}
+    z = noise  # x_{t=0}
 
     for i in range(num_steps):
-        k = steps[i]          # e.g. 1.0, 0.75, 0.5, 0.25
-        k_next = steps[i + 1]  # e.g. 0.75, 0.5, 0.25, 0.0
+        k = steps[i]
+        k_next = steps[i + 1]
         t_k = torch.full((B,), k, device=device)
 
         v = student(
@@ -388,10 +440,10 @@ def multistep_sample(
         )
         x0_hat = velocity_to_clean(z, t_k, v)  # predict clean
 
-        if k_next > 0:
+        if k_next < 1:
             # Re-noise to next timestep (flow interpolation)
             noise_next = torch.randn_like(z)
-            z = flow_interpolate(x0_hat, noise_next, k_next)
+            z = flow_interpolate(noise_next, x0_hat, k_next)
         else:
             z = x0_hat
 
