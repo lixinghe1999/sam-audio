@@ -6,6 +6,7 @@ import os
 
 import pandas as pd
 import torch
+import torchaudio
 import torch.distributed as dist
 from dataset import SETTINGS, make_dataset
 from metrics import CLAP, Aesthetic, ImageBind, Judge
@@ -42,13 +43,52 @@ def gather_and_average_results(results, world_size):
     return averaged
 
 
+def _strip_vision_branch(model: torch.nn.Module) -> None:
+    """移除 text-only eval 不需要的 vision / span 分支，释放 GPU 内存。
+
+    SAMAudio 的 vision_encoder (PerceptionEncoder) 和 visual_ranker
+    在纯文本分离任务中完全不被调用，但占大量 GPU 内存。
+    _get_video_features 在 video=None 时仅需 vision_encoder.dim，
+    通过 monkey-patch 用缓存值替代。
+    """
+    if not hasattr(model, "vision_encoder"):
+        return
+
+    # 缓存 vision dim，后续 monkey-patch 使用
+    vision_dim = model.vision_encoder.dim
+
+    # 删除视觉分支
+    del model.vision_encoder
+    if hasattr(model, "visual_ranker"):
+        del model.visual_ranker
+    if hasattr(model, "span_predictor"):
+        del model.span_predictor
+        if hasattr(model, "span_predictor_transform"):
+            del model.span_predictor_transform
+
+    # monkey-patch _get_video_features：不再访问 self.vision_encoder
+    _orig_get_video = model._get_video_features
+
+    def _patched_get_video(video, audio_features):
+        B, T, _ = audio_features.shape
+        if video is None:
+            return audio_features.new_zeros(B, vision_dim, T)
+        else:
+            return _orig_get_video(video, audio_features)
+
+    model._get_video_features = _patched_get_video
+
+
 def main(
     settings: list[str],
     cache_path: str,
     batch_size: int,
     checkpoint_path: str,
     num_workers: int = 4,
-    reranking_candidates: int = 8,
+    reranking_candidates: int = 1,
+    metrics: list[str] | None = None,
+    no_strip: bool = False,
+    num_data: int | None = None,
 ):
     world_size = int(os.environ.get("WORLD_SIZE", 1))
     rank = int(os.environ.get("RANK", 0))
@@ -59,51 +99,58 @@ def main(
         device = torch.device(f"cuda:{rank}")
         torch.cuda.set_device(device)
 
-    model = SAMAudio.from_pretrained(checkpoint_path)
-    model = model.eval().to(device)
+    if metrics is None:
+        metrics = ["clap"]
+
+    model = SAMAudio.from_pretrained(checkpoint_path).eval().to(device)
     processor = SAMAudioProcessor.from_pretrained(checkpoint_path)
 
-    judge_metric = Judge(device=device)
-    aes_metric = Aesthetic(device=device)
-    clap_metric = CLAP(device=device)
-    imagebind_metric = ImageBind(device=device)
+    if not no_strip:
+        _strip_vision_branch(model)
+
+    # 只实例化用户选择的 metric
+    judge_metric = Judge(device=device) if "judge" in metrics else None
+    aes_metric = Aesthetic(device=device) if "aes" in metrics else None
+    clap_metric = CLAP(device=device) if "clap" in metrics else None
+    _imagebind = None  # 懒加载
 
     for setting in settings:
-        print(f"Evaluating: {setting}")
-        dset = make_dataset(setting, cache_path=cache_path, collate_fn=processor)
-        sampler = None
-        if world_size > 1:
-            sampler = DistributedSampler(dset)
+        if rank == 0:
+            print(f"Evaluating: {setting}")
 
+        dset = make_dataset(setting, cache_path=cache_path, collate_fn=processor)
+        sampler = DistributedSampler(dset) if world_size > 1 else None
         dl = DataLoader(
-            dset,
-            batch_size=batch_size,
-            shuffle=False,
-            collate_fn=dset.collate,
-            num_workers=num_workers,
-            sampler=sampler,
+            dset, batch_size=batch_size, shuffle=False,
+            collate_fn=dset.collate, num_workers=num_workers, sampler=sampler,
         )
 
-        all_metrics = [
-            judge_metric,
-            aes_metric,
-            clap_metric,
-        ]
-
+        all_metrics = []
+        if judge_metric is not None:
+            all_metrics.append(judge_metric)
+        if aes_metric is not None:
+            all_metrics.append(aes_metric)
+        if clap_metric is not None:
+            all_metrics.append(clap_metric)
         if dset.visual:
-            all_metrics.append(imagebind_metric)
+            if _imagebind is None:
+                _imagebind = ImageBind(device=device)
+            all_metrics.append(_imagebind)
 
         dfs = []
+        running_sum: dict[str, float] = {}
+        running_n: int = 0
+        saved_count: int = 0
         with torch.inference_mode():
-            for batch in tqdm(dl, disable=rank > 1):
+            pbar = tqdm(dl, disable=rank > 1, desc=setting)
+            for batch in pbar:
                 batch = batch.to(device)
                 result = model.separate(
                     batch, reranking_candidates=reranking_candidates
                 )
+                input_wavs = model.unbatch(batch.audios.squeeze(1), batch.wav_sizes)
                 mets = {}
                 for metric in all_metrics:
-                    input_wavs = model.unbatch(batch.audios.squeeze(1), batch.wav_sizes)
-
                     mets.update(
                         metric(
                             target_wavs=result.target,
@@ -113,8 +160,61 @@ def main(
                             videos=batch.masked_video,
                         )
                     )
-
                 dfs.append(pd.DataFrame.from_dict(mets))
+
+                # 累加运行统计，在 tqdm 中显示当前值和平均值
+                running_n += 1
+                for k, v_list in mets.items():
+                    running_sum[k] = running_sum.get(k, 0.0) + sum(v_list) / len(v_list)
+                postfix = {
+                    k: f"{running_sum[k] / running_n:.3f}"
+                    for k in running_sum
+                }
+                pbar.set_postfix(postfix)
+
+                # --num-data: 保存输入/输出到 ./output/<setting>/ 并提前退出
+                if num_data is not None and rank == 0:
+                    save_dir = os.path.join("output", setting)
+                    os.makedirs(save_dir, exist_ok=True)
+                    batch_meta = []
+                    for i in range(len(result.target)):
+                        if saved_count >= num_data:
+                            break
+                        in_wav = input_wavs[i]
+                        in_path = f"input_{saved_count:04d}.wav"
+                        torchaudio.save(
+                            os.path.join(save_dir, in_path),
+                            (in_wav.unsqueeze(0) if in_wav.ndim == 1 else in_wav).cpu(),
+                            model.sample_rate,
+                        )
+                        out_wav = result.target[i]
+                        out_path = f"output_{saved_count:04d}.wav"
+                        torchaudio.save(
+                            os.path.join(save_dir, out_path),
+                            (out_wav.unsqueeze(0) if out_wav.ndim == 1 else out_wav).cpu(),
+                            model.sample_rate,
+                        )
+                        batch_meta.append({
+                            "index": saved_count,
+                            "input": in_path,
+                            "output": out_path,
+                            "description": batch.descriptions[i],
+                        })
+                        saved_count += 1
+
+                    meta_path = os.path.join(save_dir, "metadata.json")
+                    if os.path.exists(meta_path):
+                        with open(meta_path) as f:
+                            existing = json.load(f)
+                    else:
+                        existing = []
+                    existing.extend(batch_meta)
+                    with open(meta_path, "w") as f:
+                        json.dump(existing, f, indent=2)
+
+                    if saved_count >= num_data:
+                        print(f"Saved {saved_count} samples to {save_dir}, exiting early.")
+                        break
 
         df = pd.concat(dfs)
         averaged_results = gather_and_average_results(df, world_size)
@@ -125,6 +225,7 @@ def main(
             outfile = f"results/{setting}.json"
             with open(outfile, "w") as fout:
                 print(json.dumps(results_dict), file=fout)
+
 
 
 if __name__ == "__main__":
@@ -144,13 +245,31 @@ if __name__ == "__main__":
         help="Where to cache downloaded datasets",
     )
     parser.add_argument(
-        "--checkpoint-path", "-p", type=str, default="facebook/sam-audio-large"
+        "--checkpoint-path", "-p", type=str, default="facebook/sam-audio-small"
     )
     parser.add_argument("--batch-size", "-b", type=int, default=1, help="Batch size")
     parser.add_argument(
         "--num-workers", "-w", type=int, default=4, help="Number of workers"
     )
-    parser.add_argument("--candidates", "-c", type=int, default=8)
+    parser.add_argument("--candidates", "-c", type=int, default=1)
+    parser.add_argument(
+        "--no-strip",
+        action="store_true",
+        help="Keep all model branches (vision, span) — needed for visual eval",
+    )
+    parser.add_argument(
+        "--num-data",
+        type=int,
+        default=None,
+        help="Limit to N samples, save input/output to ./output/<setting>/, and exit",
+    )
+    parser.add_argument(
+        "--metrics",
+        nargs="+",
+        choices=["clap", "aes", "judge"],
+        default=["clap"],
+        help="Metrics to compute (default: clap only, lightest)",
+    )
     opt = parser.parse_args()
     main(
         settings=opt.setting,
@@ -159,4 +278,7 @@ if __name__ == "__main__":
         checkpoint_path=opt.checkpoint_path,
         num_workers=opt.num_workers,
         reranking_candidates=opt.candidates,
+        metrics=opt.metrics,
+        no_strip=opt.no_strip,
+        num_data=opt.num_data,
     )

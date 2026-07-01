@@ -14,11 +14,19 @@ class Judge(torch.nn.Module):
         device: Optional[torch.device] = None,
     ):
         super().__init__()
-        self.model = SAMAudioJudgeModel.from_pretrained(checkpoint).to(device)
-        self.processor = SAMAudioJudgeProcessor.from_pretrained(checkpoint)
         self.device = device or torch.device(
             "cuda" if torch.cuda.is_available() else "cpu"
         )
+        # 延迟 GPU 加载：init 时留在 CPU，forward 时按需搬到 GPU
+        # 避免与主模型 SAMAudio 同时抢占 GPU 内存导致 OOM
+        self.model = SAMAudioJudgeModel.from_pretrained(checkpoint)
+        self.processor = SAMAudioJudgeProcessor.from_pretrained(checkpoint)
+        self._on_gpu = False
+
+    def _ensure_gpu(self):
+        if not self._on_gpu and self.device.type == "cuda":
+            self.model = self.model.to(self.device)
+            self._on_gpu = True
 
     def forward(
         self,
@@ -35,6 +43,7 @@ class Judge(torch.nn.Module):
                 separated_audio=[x.cpu() for x in target_wavs],
                 sampling_rate=target_wavs_sample_rate,
             ).to(self.device)
+            self._ensure_gpu()
             result = self.model(**processed)
             return {
                 "JudgeOverall": result.overall.squeeze(-1).cpu().tolist(),

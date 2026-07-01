@@ -349,6 +349,125 @@ class SAMAudio(BaseModel):
             noise=noise,
         )
 
+    @torch.inference_mode()
+    def few_step_separate(
+        self,
+        batch: Batch,
+        num_steps: int = 4,
+        noise: Optional[torch.Tensor] = None,
+        reranking_candidates: int = 1,
+        predict_spans: bool = False,
+    ) -> SeparationResult:
+        """Turbo inference: K-step Euler sampling replacing 16-step ODE.
+
+        Corresponds to a distilled SAM-Audio-Turbo checkpoint with
+        :math:`\\texttt{num\\_steps} \\in \\{1, 2, 4\\}` Euler steps.
+        The encode / decode pipeline is identical to :meth:`separate`.
+
+        Args:
+            batch: Preprocessed input batch.
+            num_steps: Euler steps for generation (1 / 2 / 4).
+            noise: Optional fixed noise for reproducibility.
+            reranking_candidates: Number of candidate outputs for reranking.
+            predict_spans: Whether to run span prediction.
+
+        Returns:
+            :class:`SeparationResult` with target and residual waveforms.
+        """
+        from sam_audio.turbo.sampler import euler_sample
+
+        forward_args = self._get_forward_args(
+            batch, candidates=reranking_candidates
+        )
+
+        if predict_spans and hasattr(self, "span_predictor") and batch.anchors is None:
+            batch = self.predict_spans(
+                batch=batch,
+                audio_features=self._unrepeat_from_reranking(
+                    forward_args["audio_features"], reranking_candidates
+                ),
+                audio_pad_mask=self._unrepeat_from_reranking(
+                    forward_args["audio_pad_mask"], reranking_candidates
+                ),
+            )
+            forward_args.update(
+                {
+                    "anchor_ids": self._repeat_for_reranking(
+                        batch.anchor_ids, reranking_candidates
+                    ),
+                    "anchor_alignment": self._repeat_for_reranking(
+                        batch.anchor_alignment, reranking_candidates
+                    ),
+                }
+            )
+
+        audio_features = forward_args["audio_features"]
+        B, T, C = audio_features.shape
+        C = C // 2
+
+        if noise is None:
+            noise = torch.randn_like(audio_features)
+
+        def vector_field(t, noisy_audio):
+            if t.ndim == 0:
+                t = t.expand(noisy_audio.size(0))
+            return self.forward(
+                noisy_audio=noisy_audio,
+                time=t,
+                **forward_args,
+            )
+
+        generated_features = euler_sample(
+            vector_field, noise, num_steps=num_steps
+        )
+        generated_features = generated_features.transpose(1, 2)
+        wavs = self.audio_codec.decode(
+            generated_features.reshape(2 * B, C, T)
+        ).view(B, 2, -1)
+
+        bsz = wavs.size(0) // reranking_candidates
+        sizes = self.audio_codec.feature_idx_to_wav_idx(batch.sizes)
+        target_wavs = self.unbatch(
+            wavs[:, 0].view(bsz, reranking_candidates, -1), sizes
+        )
+        residual_wavs = self.unbatch(
+            wavs[:, 1].view(bsz, reranking_candidates, -1), sizes
+        )
+
+        if (
+            reranking_candidates > 1
+            and batch.masked_video is not None
+            and self.visual_ranker is not None
+        ):
+            scores = self.visual_ranker(
+                extracted_audio=target_wavs,
+                videos=batch.masked_video,
+                sample_rate=self.audio_codec.sample_rate,
+            )
+            idxs = scores.argmax(dim=1)
+        elif reranking_candidates > 1 and self.text_ranker is not None:
+            input_audio = [
+                audio[:, :size].expand(reranking_candidates, -1)
+                for audio, size in zip(batch.audios, sizes, strict=False)
+            ]
+            scores = self.text_ranker(
+                extracted_audio=target_wavs,
+                input_audio=input_audio,
+                descriptions=batch.descriptions,
+                sample_rate=self.audio_codec.sample_rate,
+            )
+            idxs = scores.argmax(dim=1)
+        else:
+            idxs = torch.zeros(bsz, dtype=torch.long, device=noise.device)
+
+        return SeparationResult(
+            target=[wav[idx] for wav, idx in zip(target_wavs, idxs, strict=False)],
+            residual=[
+                wavs[idx] for wavs, idx in zip(residual_wavs, idxs, strict=False)
+            ],
+            noise=noise,
+        )
+
     def unbatch(self, wavs: torch.Tensor, sizes: torch.Tensor, time_dim: int = -1):
         result = []
         for row, size in zip(wavs, sizes, strict=False):

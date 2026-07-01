@@ -2,6 +2,7 @@
 
 from typing import Callable
 
+from .lass import LASS
 from .musdb import MUSDB
 from .sam_audio_bench import SAMAudioBench
 
@@ -62,6 +63,10 @@ SETTINGS = {
         SAMAudioBench,
         {"span": False, "visual": True, "subset": "instr-onscreen-50:visual-only"},
     ),
+    # LASS (DCASE) — text-queried sound separation
+    "lass-val": (LASS, {"split": "validation"}),
+    "lass-real": (LASS, {"split": "evaluation_real"}),
+    "lass-synth": (LASS, {"split": "evaluation_synthetic"}),
 }
 
 

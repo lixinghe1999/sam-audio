@@ -6,3 +6,6 @@ build
 dist
 .checkpoints
 .ipynb_checkpoints
+output/
+results/
+*.log
