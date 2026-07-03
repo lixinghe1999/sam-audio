@@ -25,8 +25,10 @@ import time
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
+from tqdm import tqdm
 
 from sam_audio import SAMAudio, SAMAudioProcessor
+from sam_audio.dataset import build_dataloader
 from sam_audio.train import (
     apply_lora,
     freeze_encoders,
@@ -58,6 +60,8 @@ def turbo_train(
     device: str = "cuda",
     save_dir: str = "turbo-checkpoint",
     log_every: int = 5,
+    val_loader: DataLoader | None = None,
+    val_every: int = 1,
     meanflow_nonzero_ratio: float = 0.25,
     meanflow_time_distribution: str = "logit_normal",
     meanflow_logit_mean: float = 0.4,
@@ -83,6 +87,8 @@ def turbo_train(
         device: Training device.
         save_dir: Checkpoint directory.
         log_every: Log metrics every N steps.
+        val_loader: Optional DataLoader for validation after each epoch.
+        val_every: Validate every N epochs (default 1).
         meanflow_nonzero_ratio: Fraction of MeanFlow samples with ``s != t``.
             Remaining samples train the instantaneous velocity at ``s=t``.
         meanflow_time_distribution: ``"logit_normal"`` or ``"uniform"``.
@@ -183,8 +189,9 @@ def turbo_train(
     for epoch in range(epochs):
         epoch_start = time.time()
         losses = []
+        pbar = tqdm(dataloader, desc=f"Epoch {epoch+1}/{epochs}")
 
-        for step, batch in enumerate(dataloader):
+        for step, batch in enumerate(pbar):
             # --- unpack / encode ---
             if isinstance(batch, tuple):
                 audios, descriptions = batch
@@ -262,12 +269,7 @@ def turbo_train(
 
             # --- logging ---
             losses.append(loss.item())
-
-            if (step + 1) % log_every == 0:
-                print(
-                    f"Epoch {epoch + 1:3d} | Step {step + 1:4d} | "
-                    f"{objective}: {losses[-1]:.6f}"
-                )
+            pbar.set_postfix(loss=f"{losses[-1]:.6f}")
 
         # --- epoch summary ---
         elapsed = time.time() - epoch_start
@@ -306,6 +308,88 @@ def turbo_train(
             }
         torch.save(state, f"{ckpt_path}/training_state.pt")
         print(f"  -> saved checkpoint to {ckpt_path}")
+
+        # --- validation ---
+        if val_loader is not None and (epoch + 1) % val_every == 0:
+            student.eval()
+            val_losses = []
+            val_pbar = tqdm(val_loader, desc=f"Val {epoch+1}/{epochs}")
+            for batch in val_pbar:
+                if isinstance(batch, tuple):
+                    audios, descriptions = batch
+                    batch = processor(audios=audios, descriptions=descriptions)
+                batch = batch.to(device)
+
+                conditioning_model = teacher if use_cd else student
+                base_t = getattr(conditioning_model, "base_model", conditioning_model)
+
+                with torch.no_grad(), torch.autocast(
+                    device_type=device.type,
+                    dtype=torch.bfloat16,
+                    enabled=amp_enabled,
+                ):
+                    forward_args = base_t._get_forward_args(batch)
+                del batch
+
+                audio_features = forward_args["audio_features"]
+                z_1 = torch.randn_like(audio_features)
+
+                with torch.autocast(
+                    device_type=device.type,
+                    dtype=torch.bfloat16,
+                    enabled=amp_enabled,
+                ):
+                    if use_cd:
+                        intervals = cd_intervals(num_steps)
+                        t, s = intervals[torch.randint(len(intervals), ()).item()]
+                        teacher_vf = _make_vf_fn(
+                            teacher,
+                            forward_args,
+                            disable_adapters=shared_lora_teacher,
+                            force_eval=shared_lora_teacher,
+                        )
+                        loss, _, _ = consistency_loss(
+                            teacher_vf=teacher_vf,
+                            student=student,
+                            ema_model=ema,
+                            z_0=audio_features,
+                            z_1=z_1,
+                            forward_args=forward_args,
+                            t=t,
+                            s=s,
+                            loss_fn="huber",
+                        )
+                    else:
+                        t, s = sample_meanflow_times(
+                            audio_features.size(0),
+                            audio_features.device,
+                            nonzero_ratio=meanflow_nonzero_ratio,
+                            distribution=meanflow_time_distribution,
+                            logit_mean=meanflow_logit_mean,
+                            logit_std=meanflow_logit_std,
+                        )
+                        loss, _, _ = meanflow_loss(
+                            student=student,
+                            clean=audio_features,
+                            noise=z_1,
+                            forward_args=forward_args,
+                            t=t,
+                            s=s,
+                            adaptive_p=meanflow_adaptive_p,
+                            adaptive_eps=meanflow_adaptive_eps,
+                        )
+
+                val_losses.append(loss.item())
+                val_pbar.set_postfix(val_loss=f"{loss.item():.6f}")
+
+            avg_val = sum(val_losses) / len(val_losses)
+            print(f"  val_loss: {avg_val:.6f}")
+
+            # restore training mode
+            student.train()
+            if not use_cd:
+                student.eval()
+            freeze_encoders(student)
 
     return student
 
@@ -361,6 +445,18 @@ if __name__ == "__main__":
         type=str,
         default="/home/lixing/audiolens/dataset",
     )
+    parser.add_argument(
+        "--val",
+        action="store_true",
+        default=False,
+        help="Enable validation on Clotho validation split after each epoch",
+    )
+    parser.add_argument(
+        "--val-every",
+        type=int,
+        default=1,
+        help="Validate every N epochs (default: 1)",
+    )
     args = parser.parse_args()
 
     device = args.device if torch.cuda.is_available() else "cpu"
@@ -403,73 +499,19 @@ if __name__ == "__main__":
     processor = SAMAudioProcessor.from_pretrained(args.model_id)
 
     # ── Dataset ───────────────────────────────────────────────────────
-    # (preserved from original DMD setup)
-    import json
-    import os.path as osp
-
-    import pandas as pd
-    import torchaudio
-    from torch.utils.data import ConcatDataset, Dataset
-
-    SR = 48_000
-
-    class ClothoDS(Dataset):
-        def __init__(self, data_root=args.data_dir, sr=SR):
-            self.sr = sr
-            csv_path = osp.join(data_root, "clotho_captions_development.csv")
-            self.audio_dir = osp.join(data_root, "clotho", "development", "audio")
-            df = pd.read_csv(csv_path)
-            self.items = []
-            for _, row in df.iterrows():
-                fname = row["file_name"]
-                for k in range(1, 6):
-                    self.items.append((fname, row[f"caption_{k}"]))
-
-        def __len__(self):
-            return len(self.items)
-
-        def __getitem__(self, idx):
-            fname, caption = self.items[idx]
-            wav, sr = torchaudio.load(osp.join(self.audio_dir, fname))
-            if sr != self.sr:
-                wav = torchaudio.functional.resample(wav, sr, self.sr)
-            return wav.mean(0, keepdim=True), caption
-
-    class FSD50KDevDS(Dataset):
-        def __init__(self, data_root=args.data_dir, sr=SR):
-            self.sr = sr
-            json_path = osp.join(data_root, "fsd50k_dev_auto_caption.json")
-            self.audio_dir = osp.join(data_root, "FSD50K", "FSD50K.dev_audio")
-            with open(json_path) as f:
-                entries = json.load(f)["data"]
-            self.items = [(e["wav"], e["caption"]) for e in entries]
-
-        def __len__(self):
-            return len(self.items)
-
-        def __getitem__(self, idx):
-            fname, caption = self.items[idx]
-            wav, sr = torchaudio.load(osp.join(self.audio_dir, fname))
-            if sr != self.sr:
-                wav = torchaudio.functional.resample(wav, sr, self.sr)
-            return wav.mean(0, keepdim=True), caption
-
-    def _collate(items):
-        audios, descriptions = zip(*items)
-        return list(audios), list(descriptions)
-
-    clotho = ClothoDS()
-    fsd50k = FSD50KDevDS()
-    print(f"Clotho: {len(clotho)} items, FSD50K: {len(fsd50k)} items")
-
-    train_data = ConcatDataset([clotho, fsd50k])
-    train_loader = DataLoader(
-        train_data,
-        batch_size=args.batch_size,
-        shuffle=True,
-        collate_fn=_collate,
-        num_workers=4,
+    train_loader = build_dataloader(
+        split="train", data_root=args.data_dir,
+        batch_size=args.batch_size, num_workers=4,
     )
+    print(f"Train dataset: {len(train_loader.dataset)} items")
+
+    val_loader = None
+    if args.val:
+        val_loader = build_dataloader(
+            split="val", data_root=args.data_dir,
+            batch_size=args.batch_size, num_workers=4,
+        )
+        print(f"Val dataset:   {len(val_loader.dataset)} items")
 
     # ── Train ─────────────────────────────────────────────────────────
     student = turbo_train(
@@ -484,6 +526,8 @@ if __name__ == "__main__":
         ema_decay=args.ema_decay,
         device=device,
         save_dir=args.save_dir,
+        val_loader=val_loader,
+        val_every=args.val_every,
         meanflow_nonzero_ratio=args.meanflow_nonzero_ratio,
         meanflow_time_distribution=args.meanflow_time_distribution,
         meanflow_logit_mean=args.meanflow_logit_mean,

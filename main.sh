@@ -1,14 +1,9 @@
-#!/usr/bin/env bash
-# Evaluate LoRA-fine-tuned SAM-Audio on LASS evaluation splits.
-# Run after: python lora_train.py
-set -euo pipefail
+CUDA_VISIBLE_DEVICES=0 nohup python turbo_train.py \
+  --objective meanflow \
+  --use-lora \
+  --epochs 20 > meanflow_train.log 2>&1 &
 
-CUDA_VISIBLE_DEVICES=0 python lora_train.py > lora_train.log 2>&1 &
-
-CUDA_VISIBLE_DEVICES=0 python turbo_train.py --num-steps 4 --epochs 20 --use-lora > turbo_train.log 2>&1 &
-
-CUDA_VISIBLE_DEVICES=0 python eval/main.py \
-    --setting lass-synth lass-real \
-    --checkpoint-path "lass-lora-merged" \
-    --batch-size 1 \
-    --metrics clap aes judge > eval.log 2>&1 &
+CUDA_VISIBLE_DEVICES=1 nohup python turbo_train.py \
+  --objective consistency_distillation \
+  --use-lora \
+  --num-steps 4 > cd_train.log 2>&1 &
