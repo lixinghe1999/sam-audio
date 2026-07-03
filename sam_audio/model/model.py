@@ -138,6 +138,7 @@ class SAMAudio(BaseModel):
         anchor_ids: Optional[torch.Tensor] = None,
         anchor_alignment: Optional[torch.Tensor] = None,
         audio_pad_mask: Optional[torch.Tensor] = None,
+        flow_interval: Optional[torch.Tensor] = None,
     ):
         """
         Forward pass for the model.  Represents one function evaluation of the ODE.
@@ -150,6 +151,8 @@ class SAMAudio(BaseModel):
             audio_features (torch.Tensor): Clean audio features [B x T x C].
             text_features (torch.Tensor): Encoded text features tensor [B x T x C].
             time (torch.Tensor): Timestep tensor for positional encoding [B].
+            flow_interval: Optional MeanFlow interval length ``s - t`` [B].
+                ``None`` preserves the original flow-matching behavior.
             masked_video_features (Optional[torch.Tensor], optional): Masked video features tensor. [B x C x T].
             text_mask (Optional[torch.Tensor], optional): Padding mask for text features. [B x T].
             anchor_ids (Optional[torch.Tensor], optional): Anchor IDs tensor. Defaults to None [B x T].
@@ -167,13 +170,23 @@ class SAMAudio(BaseModel):
             anchor_alignment=anchor_alignment,
         )
 
-        memory = timestep_emb = self.timestep_emb(time, pos=time).unsqueeze(1)
+        timestep_emb = self.timestep_emb(time, pos=time)
+        if flow_interval is not None:
+            # Reuse the pretrained time basis and center at interval zero.
+            # This adds no checkpoint parameters and makes h=0 exactly match
+            # the pretrained instantaneous-velocity model in eval mode.
+            zero = torch.zeros_like(flow_interval)
+            timestep_emb = timestep_emb + self.timestep_emb(
+                flow_interval, pos=flow_interval
+            ) - self.timestep_emb(zero, pos=zero)
+        memory = timestep_emb.unsqueeze(1)
         if text_features is not None:
-            memory = self.memory_proj(text_features) + timestep_emb
+            memory = self.memory_proj(text_features) + memory
 
         return self.transformer(
             aligned_inputs,
             time,
+            flow_interval=flow_interval,
             padding_mask=audio_pad_mask,
             memory=memory,
             memory_padding_mask=text_mask,

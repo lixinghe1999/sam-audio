@@ -1,19 +1,9 @@
 #!/usr/bin/env python3
-"""Consistency Distillation (CD) training for SAM-Audio-Turbo.
+"""Few-step SAM-Audio training with consistency distillation or MeanFlow.
 
-Distills the 16-step flow-matching teacher into a 1--4 step student,
-achieving ~4--16x inference speed-up.
-
-Core idea:
-    - Student predicts clean endpoint from any noisy state along the
-      teacher ODE trajectory.
-    - EMA student (same architecture, frozen) from a cleaner state
-      provides the regression target.
-    - Teacher only runs ODE segments for supervision (no gradient).
-
-Memory (LoRA mode, BF16):
-    teacher (~4.5GB) + student (~4.5GB) + EMA shadow (~4.5GB, no opt state)
-    vs. DMD: teacher + student + discriminator + 3 optimizers → ~2GB saved.
+Consistency distillation uses teacher ODE segments and an EMA target.
+MeanFlow is simulation-free: it learns interval-average velocity using the
+MeanFlow identity and a no-grad Jacobian-vector product (JVP).
 
 Usage:
     # Full-weight distillation (4-step student)
@@ -21,6 +11,9 @@ Usage:
 
     # LoRA-based distillation (smaller GPU footprint)
     python turbo_train.py --num-steps 4 --use-lora --lora-rank 8
+
+    # MeanFlow (one-step objective; no teacher or EMA)
+    python turbo_train.py --objective meanflow --use-lora --epochs 20
 """
 
 from __future__ import annotations
@@ -45,6 +38,7 @@ from sam_audio.turbo.consistency import (
     consistency_loss,
     _make_vf_fn,
 )
+from sam_audio.turbo.meanflow import meanflow_loss, sample_meanflow_times
 
 
 # ── training loop ────────────────────────────────────────────────────────
@@ -56,6 +50,7 @@ def turbo_train(
     dataloader: DataLoader,
     *,
     teacher: nn.Module | None = None,
+    objective: str = "consistency_distillation",
     num_steps: int = 4,
     epochs: int = 20,
     lr: float = 1e-5,
@@ -63,8 +58,14 @@ def turbo_train(
     device: str = "cuda",
     save_dir: str = "turbo-checkpoint",
     log_every: int = 5,
+    meanflow_nonzero_ratio: float = 0.25,
+    meanflow_time_distribution: str = "logit_normal",
+    meanflow_logit_mean: float = 0.4,
+    meanflow_logit_std: float = 1.0,
+    meanflow_adaptive_p: float = 1.0,
+    meanflow_adaptive_eps: float = 0.01,
 ):
-    """Consistency Distillation training loop.
+    """Train SAM-Audio with consistency distillation or MeanFlow.
 
     Args:
         student: Trainable student SAM-Audio (may be PeftModel).
@@ -72,7 +73,9 @@ def turbo_train(
         dataloader: DataLoader yielding ``(audios, descriptions)`` tuples.
         teacher: Frozen teacher SAM-Audio. When ``None`` (LoRA mode), the
             student's adapters are disabled for teacher calls, so the frozen
-            pretrained base supplies the teacher without a second model copy.
+            pretrained base supplies the CD teacher without a second model copy.
+            MeanFlow does not use a teacher.
+        objective: ``"consistency_distillation"`` or ``"meanflow"``.
         num_steps: Number of CD intervals (1 / 2 / 4).
         epochs: Training epochs.
         lr: Learning rate for student (single optimizer, no discriminator).
@@ -80,14 +83,36 @@ def turbo_train(
         device: Training device.
         save_dir: Checkpoint directory.
         log_every: Log metrics every N steps.
+        meanflow_nonzero_ratio: Fraction of MeanFlow samples with ``s != t``.
+            Remaining samples train the instantaneous velocity at ``s=t``.
+        meanflow_time_distribution: ``"logit_normal"`` or ``"uniform"``.
+        meanflow_logit_mean: Logit-normal mean, adapted to noise-at-zero time.
+        meanflow_logit_std: Logit-normal standard deviation.
+        meanflow_adaptive_p: Exponent for adaptive MeanFlow loss weighting.
+        meanflow_adaptive_eps: Stabilizer for adaptive loss weighting.
     """
     # ── freeze teacher ──────────────────────────────────────────────
     device = torch.device(device)
     amp_enabled = device.type == "cuda"
+    valid_objectives = {"consistency_distillation", "meanflow"}
+    if objective not in valid_objectives:
+        raise ValueError(
+            f"objective must be one of {sorted(valid_objectives)}, got {objective!r}"
+        )
+    use_cd = objective == "consistency_distillation"
     if num_steps < 1:
         raise ValueError(f"num_steps must be positive, got {num_steps}")
+    if log_every < 1:
+        raise ValueError(f"log_every must be positive, got {log_every}")
+    if not use_cd:
+        if not 0 <= meanflow_nonzero_ratio <= 1:
+            raise ValueError("meanflow_nonzero_ratio must be between 0 and 1")
+        if meanflow_logit_std <= 0:
+            raise ValueError("meanflow_logit_std must be positive")
+        if meanflow_adaptive_p < 0 or meanflow_adaptive_eps <= 0:
+            raise ValueError("invalid MeanFlow adaptive-weighting parameters")
 
-    if teacher is not None:
+    if use_cd and teacher is not None:
         teacher.eval()
         teacher.to(device)
         for p in teacher.parameters():
@@ -110,18 +135,23 @@ def turbo_train(
         encoder.eval()
         for param in encoder.parameters():
             param.requires_grad_(False)
-        if teacher is not None:
+        if use_cd and teacher is not None:
             encoder.to("cpu")
 
     # ── derive teacher from student.base_model when not explicitly provided ──
-    shared_lora_teacher = teacher is None
-    if teacher is None:
+    shared_lora_teacher = use_cd and teacher is None
+    if shared_lora_teacher:
         if not hasattr(student, "disable_adapter"):
             raise ValueError(
                 "teacher=None is only supported for adapter training; pass a "
                 "separate frozen teacher for full-weight distillation"
             )
         teacher = student
+
+    # MeanFlow's JVP must see the same deterministic function as its ordinary
+    # prediction. Gradients still work in eval mode, while dropout is disabled.
+    if not use_cd:
+        student.eval()
 
     # ── EMA student (shadow weights, no optimizer) ──────────────────
     trainable_named = [
@@ -131,7 +161,7 @@ def turbo_train(
     ]
     if not trainable_named:
         raise ValueError("student has no trainable parameters")
-    ema = EMAHelper(trainable_named, decay=ema_decay)
+    ema = EMAHelper(trainable_named, decay=ema_decay) if use_cd else None
 
     # ── optimizer (single, no discriminator) ────────────────────────
     optimizer = torch.optim.AdamW(
@@ -141,14 +171,18 @@ def turbo_train(
     # ── stats ───────────────────────────────────────────────────────
     trainable = sum(p.numel() for p in student.parameters() if p.requires_grad)
     print(f"Student trainable params: {trainable:,}")
-    print(f"CD intervals:             {num_steps}")
-    print(f"EMA decay:                {ema_decay}")
+    print(f"Training objective:       {objective}")
+    if use_cd:
+        print(f"CD intervals:             {num_steps}")
+        print(f"EMA decay:                {ema_decay}")
+    else:
+        print(f"MeanFlow interval ratio:  {meanflow_nonzero_ratio}")
     os.makedirs(save_dir, exist_ok=True)
 
     # ── epoch loop ──────────────────────────────────────────────────
     for epoch in range(epochs):
         epoch_start = time.time()
-        losses_cd = []
+        losses = []
 
         for step, batch in enumerate(dataloader):
             # --- unpack / encode ---
@@ -157,7 +191,8 @@ def turbo_train(
                 batch = processor(audios=audios, descriptions=descriptions)
             batch = batch.to(device)
 
-            base_t = getattr(teacher, "base_model", teacher)
+            conditioning_model = teacher if use_cd else student
+            base_t = getattr(conditioning_model, "base_model", conditioning_model)
 
             with torch.no_grad(), torch.autocast(
                 device_type=device.type,
@@ -172,61 +207,76 @@ def turbo_train(
             audio_features = forward_args["audio_features"]  # z_0: clean latent
             z_1 = torch.randn_like(audio_features)  # noise
 
-            # --- sample a CD interval ---
-            intervals = cd_intervals(num_steps)
-            # Pick one interval per batch; random or round-robin
-            t, s = intervals[torch.randint(len(intervals), ()).item()]
-
-            # --- teacher ODE segment (t → s, no grad) ---
-            teacher_vf = _make_vf_fn(
-                teacher,
-                forward_args,
-                disable_adapters=shared_lora_teacher,
-                force_eval=shared_lora_teacher,
-            )
-
-            # === Consistency loss ===
             optimizer.zero_grad(set_to_none=True)
             with torch.autocast(
                 device_type=device.type,
                 dtype=torch.bfloat16,
                 enabled=amp_enabled,
             ):
-                loss, _, _ = consistency_loss(
-                    teacher_vf=teacher_vf,
-                    student=student,
-                    ema_model=ema,
-                    z_0=audio_features,
-                    z_1=z_1,
-                    forward_args=forward_args,
-                    t=t,
-                    s=s,
-                    loss_fn="huber",
-                )
+                if use_cd:
+                    intervals = cd_intervals(num_steps)
+                    t, s = intervals[torch.randint(len(intervals), ()).item()]
+                    teacher_vf = _make_vf_fn(
+                        teacher,
+                        forward_args,
+                        disable_adapters=shared_lora_teacher,
+                        force_eval=shared_lora_teacher,
+                    )
+                    loss, _, _ = consistency_loss(
+                        teacher_vf=teacher_vf,
+                        student=student,
+                        ema_model=ema,
+                        z_0=audio_features,
+                        z_1=z_1,
+                        forward_args=forward_args,
+                        t=t,
+                        s=s,
+                        loss_fn="huber",
+                    )
+                else:
+                    t, s = sample_meanflow_times(
+                        audio_features.size(0),
+                        audio_features.device,
+                        nonzero_ratio=meanflow_nonzero_ratio,
+                        distribution=meanflow_time_distribution,
+                        logit_mean=meanflow_logit_mean,
+                        logit_std=meanflow_logit_std,
+                    )
+                    loss, _, _ = meanflow_loss(
+                        student=student,
+                        clean=audio_features,
+                        noise=z_1,
+                        forward_args=forward_args,
+                        t=t,
+                        s=s,
+                        adaptive_p=meanflow_adaptive_p,
+                        adaptive_eps=meanflow_adaptive_eps,
+                    )
 
             loss.backward()
             optimizer.step()
 
             # --- update EMA ---
-            ema.update()
+            if ema is not None:
+                ema.update()
 
             # --- logging ---
-            losses_cd.append(loss.item())
+            losses.append(loss.item())
 
             if (step + 1) % log_every == 0:
                 print(
                     f"Epoch {epoch + 1:3d} | Step {step + 1:4d} | "
-                    f"CD: {losses_cd[-1]:.6f}"
+                    f"{objective}: {losses[-1]:.6f}"
                 )
 
         # --- epoch summary ---
         elapsed = time.time() - epoch_start
-        if not losses_cd:
+        if not losses:
             raise ValueError("dataloader produced no batches")
-        avg_loss = sum(losses_cd) / len(losses_cd)
+        avg_loss = sum(losses) / len(losses)
         print(
             f"Epoch {epoch + 1:3d} | "
-            f"CD_avg: {avg_loss:.6f} | "
+            f"{objective}_avg: {avg_loss:.6f} | "
             f"Time: {elapsed:.1f}s"
         )
 
@@ -238,11 +288,22 @@ def turbo_train(
             os.makedirs(ckpt_path, exist_ok=True)
             torch.save(student.state_dict(), f"{ckpt_path}/model.pt")
         state = {
-            "ema": ema.state_dict(),
+            "objective": objective,
             "optimizer": optimizer.state_dict(),
             "epoch": epoch + 1,
             "num_steps": num_steps,
         }
+        if ema is not None:
+            state["ema"] = ema.state_dict()
+        else:
+            state["meanflow"] = {
+                "nonzero_ratio": meanflow_nonzero_ratio,
+                "time_distribution": meanflow_time_distribution,
+                "logit_mean": meanflow_logit_mean,
+                "logit_std": meanflow_logit_std,
+                "adaptive_p": meanflow_adaptive_p,
+                "adaptive_eps": meanflow_adaptive_eps,
+            }
         torch.save(state, f"{ckpt_path}/training_state.pt")
         print(f"  -> saved checkpoint to {ckpt_path}")
 
@@ -252,7 +313,13 @@ def turbo_train(
 # ══════════════════════════════════════════════════════════════════════════
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
-        description="Consistency Distillation for SAM-Audio-Turbo"
+        description="Consistency Distillation or MeanFlow for SAM-Audio-Turbo"
+    )
+    parser.add_argument(
+        "--objective",
+        choices=("consistency_distillation", "meanflow"),
+        default="consistency_distillation",
+        help="Turbo training objective",
     )
     parser.add_argument(
         "--num-steps", type=int, default=4, help="CD intervals (1/2/4)"
@@ -263,6 +330,21 @@ if __name__ == "__main__":
     parser.add_argument(
         "--ema-decay", type=float, default=0.999, help="EMA decay for target student"
     )
+    parser.add_argument(
+        "--meanflow-nonzero-ratio",
+        type=float,
+        default=0.25,
+        help="Fraction of MeanFlow samples using a non-zero interval",
+    )
+    parser.add_argument(
+        "--meanflow-time-distribution",
+        choices=("logit_normal", "uniform"),
+        default="logit_normal",
+    )
+    parser.add_argument("--meanflow-logit-mean", type=float, default=0.4)
+    parser.add_argument("--meanflow-logit-std", type=float, default=1.0)
+    parser.add_argument("--meanflow-adaptive-p", type=float, default=1.0)
+    parser.add_argument("--meanflow-adaptive-eps", type=float, default=0.01)
     parser.add_argument(
         "--use-lora",
         action="store_true",
@@ -284,7 +366,10 @@ if __name__ == "__main__":
     device = args.device if torch.cuda.is_available() else "cpu"
     model_dtype = torch.bfloat16 if device != "cpu" else torch.float32
     print(f"Device: {device}")
-    print(f"Mode: {'LoRA' if args.use_lora else 'full-weight'} CD")
+    print(
+        f"Mode: {'LoRA' if args.use_lora else 'full-weight'} "
+        f"{args.objective}"
+    )
 
     # ── Load model(s) ─────────────────────────────────────────────────
     teacher = None
@@ -300,11 +385,16 @@ if __name__ == "__main__":
             f"LoRA trainable: {trainable:,} / {total:,} "
             f"({100 * trainable / total:.1f}%)"
         )
-    else:
+    elif args.objective == "consistency_distillation":
         teacher = SAMAudio.from_pretrained(args.model_id)
         teacher = teacher.to(model_dtype)
         strip_vision_branch(teacher)
 
+        student = SAMAudio.from_pretrained(args.model_id)
+        student = student.to(model_dtype)
+        strip_vision_branch(student)
+    else:
+        # MeanFlow is simulation-free and needs neither teacher nor EMA model.
         student = SAMAudio.from_pretrained(args.model_id)
         student = student.to(model_dtype)
         strip_vision_branch(student)
@@ -387,13 +477,20 @@ if __name__ == "__main__":
         student=student,
         processor=processor,
         dataloader=train_loader,
+        objective=args.objective,
         num_steps=args.num_steps,
         epochs=args.epochs,
         lr=args.lr,
         ema_decay=args.ema_decay,
         device=device,
         save_dir=args.save_dir,
+        meanflow_nonzero_ratio=args.meanflow_nonzero_ratio,
+        meanflow_time_distribution=args.meanflow_time_distribution,
+        meanflow_logit_mean=args.meanflow_logit_mean,
+        meanflow_logit_std=args.meanflow_logit_std,
+        meanflow_adaptive_p=args.meanflow_adaptive_p,
+        meanflow_adaptive_eps=args.meanflow_adaptive_eps,
     )
 
-    print("CD distillation complete.")
+    print(f"{args.objective} training complete.")
     print(f"Checkpoints saved to {args.save_dir}/")

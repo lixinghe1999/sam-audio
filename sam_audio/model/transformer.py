@@ -475,6 +475,7 @@ class DiT(torch.nn.Module):
         x: torch.Tensor,
         time: torch.Tensor,
         *,
+        flow_interval: Optional[torch.Tensor] = None,
         padding_mask: Optional[torch.Tensor] = None,
         memory: Optional[torch.Tensor] = None,
         memory_padding_mask: Optional[torch.Tensor] = None,
@@ -488,6 +489,9 @@ class DiT(torch.nn.Module):
         h = F.dropout(h, p=self.dropout, training=self.training)
 
         t = self.t_embedder(time)  # B -> B D
+        if flow_interval is not None:
+            zero = torch.zeros_like(flow_interval)
+            t = t + self.t_embedder(flow_interval) - self.t_embedder(zero)
 
         t0 = self.t_block_non_linearity(t)
         t0 = self.t_block(t0)  # B D -> B 6D

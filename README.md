@@ -126,6 +126,23 @@ We additional release another variant (in each size) that is better specifically
 - [`sam-audio-base-tv`](https://huggingface.co/facebook/sam-audio-base-tv)
 - [`sam-audio-large-tv`](https://huggingface.co/facebook/sam-audio-large-tv)
 
+## Turbo Training
+
+`turbo_train.py` supports both consistency distillation (the default) and
+MeanFlow. LoRA is recommended for the lowest persistent GPU-memory use.
+
+```bash
+# Consistency distillation
+python turbo_train.py --objective consistency_distillation --use-lora --num-steps 4
+
+# MeanFlow (simulation-free, no teacher or EMA model)
+python turbo_train.py --objective meanflow --use-lora
+```
+
+MeanFlow defaults to the paper's 25% non-zero-interval mixture. Adjust it with
+`--meanflow-nonzero-ratio`; use `--meanflow-time-distribution uniform` to
+replace the default logit-normal time sampling.
+
 ## Evaluation
 
 See the [eval](eval) directory for instructions and scripts to reproduce results from the paper

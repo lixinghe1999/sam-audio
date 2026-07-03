@@ -403,8 +403,8 @@ def multistep_sample(
     Procedure:
         1. Start from noise at t=0.
         2. Predict clean:  x0_hat = f_theta(x_{k}, k).
-        3. Re-noise to next interval:  x_{k_next} = k_next * noise + (1 - k_next) * x0_hat.
-        4. Repeat until t=0.
+        3. Re-noise to the next interval along the noise-to-clean path.
+        4. Repeat until t=1.
 
     Args:
         student:  Student model (in eval mode).
