@@ -171,6 +171,20 @@ from sam_audio.turbo import meanflow_separate
 result = meanflow_separate(model, batch, num_steps=1)
 ```
 
+### Distributed training
+
+`turbo_train.py` automatically enables DDP when launched with `torchrun`:
+
+```bash
+torchrun --standalone --nproc_per_node=4 turbo_train.py \
+  --objective meanflow --use-lora --batch-size 1
+```
+
+`--batch-size` is per GPU. The effective batch size is
+`batch-size × GPU count × gradient-accumulation-steps`. Each rank uses a
+`DistributedSampler`; metrics are reduced across ranks, while progress output
+and checkpoints are written only by rank 0.
+
 ## Evaluation
 
 See the [eval](eval) directory for instructions and scripts to reproduce results from the paper

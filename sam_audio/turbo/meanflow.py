@@ -151,6 +151,7 @@ def alphaflow_loss(
     s: torch.Tensor,
     *,
     alpha: float,
+    target_student: nn.Module | None = None,
     adaptive_p: float = 1.0,
     adaptive_eps: float = 0.01,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -160,7 +161,9 @@ def alphaflow_loss(
     a weighted composition of the empirical velocity over the first part of
     the interval and a stopped model prediction over the remainder.  This is
     JVP-free.  At ``alpha=0``, the finite difference becomes degenerate, so
-    the exact MeanFlow JVP target is used instead.
+    the exact MeanFlow JVP target is used instead. ``target_student`` may be
+    the unwrapped module when ``student`` is DDP, keeping stopped target
+    forwards out of DDP's reducer bookkeeping.
     """
     if t.shape != s.shape or t.ndim != 1 or t.size(0) != clean.size(0):
         raise ValueError("t and s must be [batch] tensors")
@@ -178,17 +181,33 @@ def alphaflow_loss(
     t_view = t.reshape((-1,) + (1,) * (clean.ndim - 1))
     z_t = (1 - t_view) * noise + t_view * clean
 
-    def u_fn(
+    def model_fn(
+        model: nn.Module,
         z_value: torch.Tensor,
         t_value: torch.Tensor,
         h_value: torch.Tensor,
     ) -> torch.Tensor:
-        return student(
+        return model(
             noisy_audio=z_value,
             time=t_value,
             flow_interval=h_value,
             **forward_args,
         )
+
+    def u_fn(
+        z_value: torch.Tensor,
+        t_value: torch.Tensor,
+        h_value: torch.Tensor,
+    ) -> torch.Tensor:
+        return model_fn(student, z_value, t_value, h_value)
+
+    def target_u_fn(
+        z_value: torch.Tensor,
+        t_value: torch.Tensor,
+        h_value: torch.Tensor,
+    ) -> torch.Tensor:
+        target_model = student if target_student is None else target_student
+        return model_fn(target_model, z_value, t_value, h_value)
 
     if alpha == 0:
         # Exact MeanFlow's JVP can be built before the online graph to reduce
@@ -199,7 +218,7 @@ def alphaflow_loss(
 
             # s is fixed along the derivative, hence d(s-t)/dt = -1.
             primal, du_dt = jvp(
-                u_fn,
+                target_u_fn,
                 (z_t, t, h),
                 (velocity, torch.ones_like(t), -torch.ones_like(h)),
             )
@@ -227,7 +246,7 @@ def alphaflow_loss(
                 intermediate_t = t + first_h
                 intermediate_z = z_t + first_h_view * velocity
                 remaining_h = s - intermediate_t
-                remaining_u = u_fn(
+                remaining_u = target_u_fn(
                     intermediate_z,
                     intermediate_t,
                     remaining_h,

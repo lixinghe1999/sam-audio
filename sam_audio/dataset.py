@@ -14,6 +14,7 @@ import os.path as osp
 
 import pandas as pd
 import torchaudio
+from torch.utils.data.distributed import DistributedSampler
 from torch.utils.data import ConcatDataset, DataLoader, Dataset
 
 SR = 48_000
@@ -148,6 +149,7 @@ def build_dataloader(
     batch_size: int = 1,
     num_workers: int = 4,
     sr: int = SR,
+    distributed: bool = False,
 ) -> DataLoader:
     """Build a DataLoader for the given split.
 
@@ -158,6 +160,8 @@ def build_dataloader(
         batch_size: Per-batch sample count.
         num_workers: DataLoader worker count.
         sr: Target sample rate.
+        distributed: Use a :class:`DistributedSampler` for the current
+            initialized process group.
 
     Returns:
         DataLoader yielding ``(list[waveform], list[description])`` tuples
@@ -179,10 +183,16 @@ def build_dataloader(
     else:
         raise ValueError(f"split must be 'train', 'val', or 'eval', got {split!r}")
 
+    sampler = (
+        DistributedSampler(dataset, shuffle=shuffle)
+        if distributed
+        else None
+    )
     return DataLoader(
         dataset,
         batch_size=batch_size,
-        shuffle=shuffle,
+        shuffle=shuffle if sampler is None else False,
+        sampler=sampler,
         collate_fn=_collate,
         num_workers=num_workers,
     )

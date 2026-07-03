@@ -19,17 +19,25 @@ Usage:
 
     # Enable finite-step AlphaFlow through the same MeanFlow objective
     python turbo_train.py --objective meanflow --alpha 0.5 --use-lora
+
+    # Four-GPU DDP (automatically detected from torchrun environment variables)
+    torchrun --standalone --nproc_per_node=4 turbo_train.py \
+        --objective meanflow --use-lora
 """
 
 from __future__ import annotations
 
 import argparse
+from contextlib import nullcontext
 import os
 import time
 
 import torch
+import torch.distributed as dist
 import torch.nn as nn
+from torch.nn.parallel import DistributedDataParallel
 from torch.utils.data import DataLoader
+from torch.utils.data.distributed import DistributedSampler
 from tqdm import tqdm
 
 from sam_audio import SAMAudio, SAMAudioProcessor
@@ -53,6 +61,18 @@ from sam_audio.turbo.meanflow import (
 
 
 # ── training loop ────────────────────────────────────────────────────────
+
+
+def _distributed_average(
+    total: float,
+    count: int,
+    device: torch.device,
+) -> float:
+    """Average a scalar sum across the initialized process group."""
+    values = torch.tensor([total, count], dtype=torch.float64, device=device)
+    if dist.is_available() and dist.is_initialized():
+        dist.all_reduce(values, op=dist.ReduceOp.SUM)
+    return (values[0] / values[1].clamp_min(1)).item()
 
 
 def _checkpoint_state_dict(
@@ -159,6 +179,9 @@ def turbo_train(
     # ── freeze teacher ──────────────────────────────────────────────
     device = torch.device(device)
     amp_enabled = device.type == "cuda"
+    distributed = dist.is_available() and dist.is_initialized()
+    rank = dist.get_rank() if distributed else 0
+    is_main_process = rank == 0
     valid_objectives = {"consistency_distillation", "meanflow"}
     if objective not in valid_objectives:
         raise ValueError(
@@ -238,7 +261,8 @@ def turbo_train(
     # student's vector-field forward. Freeze them explicitly; eval() alone
     # does not clear requires_grad. With a separate teacher, its encoders build
     # the conditioning, so the duplicate student copies can stay on CPU.
-    student_base = getattr(student, "base_model", student)
+    raw_student = student
+    student_base = getattr(raw_student, "base_model", raw_student)
     for encoder_name in ("audio_codec", "text_encoder", "vision_encoder"):
         encoder = getattr(student_base, encoder_name, None)
         if encoder is None:
@@ -267,7 +291,7 @@ def turbo_train(
     # ── EMA student (shadow weights, no optimizer) ──────────────────
     trainable_named = [
         (name, param)
-        for name, param in student.named_parameters()
+        for name, param in raw_student.named_parameters()
         if param.requires_grad
     ]
     if not trainable_named:
@@ -283,35 +307,58 @@ def turbo_train(
         [param for _, param in trainable_named], **optimizer_kwargs
     )
 
+    if distributed:
+        ddp_kwargs = {
+            "broadcast_buffers": False,
+            "find_unused_parameters": False,
+        }
+        if device.type == "cuda":
+            ddp_kwargs.update(
+                device_ids=[device.index],
+                output_device=device.index,
+            )
+        student = DistributedDataParallel(raw_student, **ddp_kwargs)
+
     # ── stats ───────────────────────────────────────────────────────
-    trainable = sum(p.numel() for p in student.parameters() if p.requires_grad)
-    print(f"Student trainable params: {trainable:,}")
-    print(f"Training objective:       {objective}")
-    print(f"Learning rate:            {lr}")
-    if use_cd:
-        print(f"CD intervals:             {num_steps}")
-        print(f"EMA decay:                {ema_decay}")
-    else:
-        print(f"Flow interval ratio:      {meanflow_nonzero_ratio}")
-        print(f"Gradient accumulation:    {gradient_accumulation_steps}")
-        print(f"Gradient clip norm:       {gradient_clip_norm}")
-        if curriculum_enabled:
-            print(f"Alpha curriculum:         {alpha_start} -> {alpha_end}")
-            print(f"Alpha schedule:           {alpha_schedule}")
+    trainable = sum(p.numel() for p in raw_student.parameters() if p.requires_grad)
+    if is_main_process:
+        print(f"Student trainable params: {trainable:,}")
+        print(f"Training objective:       {objective}")
+        print(f"Learning rate:            {lr}")
+        if distributed:
+            print(f"DDP world size:           {dist.get_world_size()}")
+        if use_cd:
+            print(f"CD intervals:             {num_steps}")
+            print(f"EMA decay:                {ema_decay}")
         else:
-            flow_method = "MeanFlow" if alpha == 0 else "AlphaFlow"
-            print(f"Flow method:              {flow_method}")
-            print(f"Flow alpha:               {alpha}")
-    os.makedirs(save_dir, exist_ok=True)
+            print(f"Flow interval ratio:      {meanflow_nonzero_ratio}")
+            print(f"Gradient accumulation:    {gradient_accumulation_steps}")
+            print(f"Gradient clip norm:       {gradient_clip_norm}")
+            if curriculum_enabled:
+                print(f"Alpha curriculum:         {alpha_start} -> {alpha_end}")
+                print(f"Alpha schedule:           {alpha_schedule}")
+            else:
+                flow_method = "MeanFlow" if alpha == 0 else "AlphaFlow"
+                print(f"Flow method:              {flow_method}")
+                print(f"Flow alpha:               {alpha}")
+        os.makedirs(save_dir, exist_ok=True)
+    if distributed:
+        dist.barrier()
 
     # ── epoch loop ──────────────────────────────────────────────────
     steps_per_epoch = len(dataloader)
     total_train_steps = epochs * steps_per_epoch
     current_alpha = alpha if alpha is not None else alpha_start
     for epoch in range(epochs):
+        if isinstance(dataloader.sampler, DistributedSampler):
+            dataloader.sampler.set_epoch(epoch)
         epoch_start = time.time()
         losses = []
-        pbar = tqdm(dataloader, desc=f"Epoch {epoch+1}/{epochs}")
+        pbar = tqdm(
+            dataloader,
+            desc=f"Epoch {epoch+1}/{epochs}",
+            disable=not is_main_process,
+        )
         optimizer.zero_grad(set_to_none=True)
 
         for step, batch in enumerate(pbar):
@@ -333,7 +380,7 @@ def turbo_train(
                 batch = processor(audios=audios, descriptions=descriptions)
             batch = batch.to(device)
 
-            conditioning_model = teacher if use_cd else student
+            conditioning_model = teacher if use_cd else raw_student
             base_t = getattr(conditioning_model, "base_model", conditioning_model)
 
             with torch.no_grad(), torch.autocast(
@@ -349,57 +396,69 @@ def turbo_train(
             audio_features = forward_args["audio_features"]  # z_0: clean latent
             z_1 = torch.randn_like(audio_features)  # noise
 
-            with torch.autocast(
-                device_type=device.type,
-                dtype=torch.bfloat16,
-                enabled=amp_enabled,
-            ):
-                if use_cd:
-                    intervals = cd_intervals(num_steps)
-                    t, s = intervals[torch.randint(len(intervals), ()).item()]
-                    teacher_vf = _make_vf_fn(
-                        teacher,
-                        forward_args,
-                        disable_adapters=shared_lora_teacher,
-                        force_eval=shared_lora_teacher,
-                    )
-                    loss, _, _ = consistency_loss(
-                        teacher_vf=teacher_vf,
-                        student=student,
-                        ema_model=ema,
-                        z_0=audio_features,
-                        z_1=z_1,
-                        forward_args=forward_args,
-                        t=t,
-                        s=s,
-                        loss_fn="huber",
-                    )
-                else:
-                    t, s = sample_meanflow_times(
-                        audio_features.size(0),
-                        audio_features.device,
-                        nonzero_ratio=meanflow_nonzero_ratio,
-                        distribution=meanflow_time_distribution,
-                        logit_mean=meanflow_logit_mean,
-                        logit_std=meanflow_logit_std,
-                    )
-                    loss, _, _ = alphaflow_loss(
-                        student=student,
-                        clean=audio_features,
-                        noise=z_1,
-                        forward_args=forward_args,
-                        t=t,
-                        s=s,
-                        alpha=current_alpha,
-                        adaptive_p=meanflow_adaptive_p,
-                        adaptive_eps=meanflow_adaptive_eps,
-                    )
-
-            (loss / gradient_accumulation_steps).backward()
             should_step = (
                 (step + 1) % gradient_accumulation_steps == 0
                 or step + 1 == steps_per_epoch
             )
+            sync_context = (
+                student.no_sync()
+                if distributed and not should_step
+                else nullcontext()
+            )
+            with sync_context:
+                with torch.autocast(
+                    device_type=device.type,
+                    dtype=torch.bfloat16,
+                    enabled=amp_enabled,
+                ):
+                    if use_cd:
+                        intervals = cd_intervals(num_steps)
+                        t, s = intervals[torch.randint(len(intervals), ()).item()]
+                        teacher_vf = _make_vf_fn(
+                            teacher,
+                            forward_args,
+                            disable_adapters=shared_lora_teacher,
+                            force_eval=shared_lora_teacher,
+                        )
+                        loss, _, _ = consistency_loss(
+                            teacher_vf=teacher_vf,
+                            student=student,
+                            ema_model=ema,
+                            z_0=audio_features,
+                            z_1=z_1,
+                            forward_args=forward_args,
+                            t=t,
+                            s=s,
+                            loss_fn="huber",
+                            target_student=(
+                                raw_student if distributed else None
+                            ),
+                        )
+                    else:
+                        t, s = sample_meanflow_times(
+                            audio_features.size(0),
+                            audio_features.device,
+                            nonzero_ratio=meanflow_nonzero_ratio,
+                            distribution=meanflow_time_distribution,
+                            logit_mean=meanflow_logit_mean,
+                            logit_std=meanflow_logit_std,
+                        )
+                        loss, _, _ = alphaflow_loss(
+                            student=student,
+                            target_student=(
+                                raw_student if distributed else None
+                            ),
+                            clean=audio_features,
+                            noise=z_1,
+                            forward_args=forward_args,
+                            t=t,
+                            s=s,
+                            alpha=current_alpha,
+                            adaptive_p=meanflow_adaptive_p,
+                            adaptive_eps=meanflow_adaptive_eps,
+                        )
+
+                (loss / gradient_accumulation_steps).backward()
             if should_step:
                 if gradient_clip_norm > 0:
                     torch.nn.utils.clip_grad_norm_(
@@ -415,32 +474,29 @@ def turbo_train(
 
             # --- logging ---
             losses.append(loss.item())
-            if use_cd:
-                pbar.set_postfix(loss=f"{losses[-1]:.6f}")
-            else:
-                pbar.set_postfix(
-                    loss=f"{losses[-1]:.6f}", alpha=f"{current_alpha:.4f}"
-                )
+            if is_main_process:
+                if use_cd:
+                    pbar.set_postfix(loss=f"{losses[-1]:.6f}")
+                else:
+                    pbar.set_postfix(
+                        loss=f"{losses[-1]:.6f}",
+                        alpha=f"{current_alpha:.4f}",
+                    )
 
         # --- epoch summary ---
         elapsed = time.time() - epoch_start
         if not losses:
             raise ValueError("dataloader produced no batches")
-        avg_loss = sum(losses) / len(losses)
-        print(
-            f"Epoch {epoch + 1:3d} | "
-            f"{objective}_avg: {avg_loss:.6f} | "
-            f"Time: {elapsed:.1f}s"
-        )
+        avg_loss = _distributed_average(sum(losses), len(losses), device)
+        if is_main_process:
+            print(
+                f"Epoch {epoch + 1:3d} | "
+                f"{objective}_avg: {avg_loss:.6f} | "
+                f"Time: {elapsed:.1f}s"
+            )
 
         # --- checkpoint ---
         ckpt_path = f"{save_dir}/epoch-{epoch + 1}"
-        checkpoint_weights = _checkpoint_state_dict(student, ema)
-        if hasattr(student, "save_pretrained"):
-            student.save_pretrained(ckpt_path, state_dict=checkpoint_weights)
-        else:
-            os.makedirs(ckpt_path, exist_ok=True)
-            torch.save(checkpoint_weights, f"{ckpt_path}/model.pt")
         state = {
             "objective": objective,
             "optimizer": optimizer.state_dict(),
@@ -469,21 +525,36 @@ def turbo_train(
                     "sigmoid_gamma": alpha_sigmoid_gamma,
                 },
             }
-        torch.save(state, f"{ckpt_path}/training_state.pt")
-        print(f"  -> saved checkpoint to {ckpt_path}")
+        if is_main_process:
+            checkpoint_weights = _checkpoint_state_dict(raw_student, ema)
+            if hasattr(raw_student, "save_pretrained"):
+                raw_student.save_pretrained(
+                    ckpt_path, state_dict=checkpoint_weights
+                )
+            else:
+                os.makedirs(ckpt_path, exist_ok=True)
+                torch.save(checkpoint_weights, f"{ckpt_path}/model.pt")
+            torch.save(state, f"{ckpt_path}/training_state.pt")
+            print(f"  -> saved checkpoint to {ckpt_path}")
+        if distributed:
+            dist.barrier()
 
         # --- validation ---
         if val_loader is not None and (epoch + 1) % val_every == 0:
             student.eval()
             val_losses = []
-            val_pbar = tqdm(val_loader, desc=f"Val {epoch+1}/{epochs}")
+            val_pbar = tqdm(
+                val_loader,
+                desc=f"Val {epoch+1}/{epochs}",
+                disable=not is_main_process,
+            )
             for batch in val_pbar:
                 if isinstance(batch, tuple):
                     audios, descriptions = batch
                     batch = processor(audios=audios, descriptions=descriptions)
                 batch = batch.to(device)
 
-                conditioning_model = teacher if use_cd else student
+                conditioning_model = teacher if use_cd else raw_student
                 base_t = getattr(conditioning_model, "base_model", conditioning_model)
 
                 with torch.no_grad(), torch.autocast(
@@ -521,6 +592,9 @@ def turbo_train(
                             t=t,
                             s=s,
                             loss_fn="huber",
+                            target_student=(
+                                raw_student if distributed else None
+                            ),
                         )
                     else:
                         t, s = sample_meanflow_times(
@@ -533,6 +607,9 @@ def turbo_train(
                         )
                         loss, _, _ = alphaflow_loss(
                             student=student,
+                            target_student=(
+                                raw_student if distributed else None
+                            ),
                             clean=audio_features,
                             noise=z_1,
                             forward_args=forward_args,
@@ -544,16 +621,20 @@ def turbo_train(
                         )
 
                 val_losses.append(loss.item())
-                val_pbar.set_postfix(val_loss=f"{loss.item():.6f}")
+                if is_main_process:
+                    val_pbar.set_postfix(val_loss=f"{loss.item():.6f}")
 
-            avg_val = sum(val_losses) / len(val_losses)
-            print(f"  val_loss: {avg_val:.6f}")
+            avg_val = _distributed_average(
+                sum(val_losses), len(val_losses), device
+            )
+            if is_main_process:
+                print(f"  val_loss: {avg_val:.6f}")
 
             # restore training mode
             student.train()
-            freeze_encoders(student)
+            freeze_encoders(raw_student)
 
-    return student
+    return raw_student
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -667,13 +748,32 @@ if __name__ == "__main__":
     )
     args = parser.parse_args()
 
-    device = args.device if torch.cuda.is_available() else "cpu"
-    compute_dtype = torch.bfloat16 if device != "cpu" else torch.float32
-    print(f"Device: {device}")
-    print(
-        f"Mode: {'LoRA' if args.use_lora else 'full-weight'} "
-        f"{args.objective}"
+    world_size = int(os.environ.get("WORLD_SIZE", "1"))
+    distributed = world_size > 1
+    local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+    if distributed:
+        use_cuda = args.device.startswith("cuda") and torch.cuda.is_available()
+        backend = "nccl" if use_cuda else "gloo"
+        if use_cuda:
+            torch.cuda.set_device(local_rank)
+            device = torch.device("cuda", local_rank)
+        else:
+            device = torch.device("cpu")
+        dist.init_process_group(backend=backend, init_method="env://")
+    else:
+        device = torch.device(
+            args.device if torch.cuda.is_available() else "cpu"
+        )
+    is_main_process = not distributed or dist.get_rank() == 0
+    compute_dtype = (
+        torch.bfloat16 if device.type != "cpu" else torch.float32
     )
+    if is_main_process:
+        print(f"Device: {device}")
+        print(
+            f"Mode: {'LoRA' if args.use_lora else 'full-weight'} "
+            f"{args.objective}"
+        )
 
     # ── Load model(s) ─────────────────────────────────────────────────
     teacher = None
@@ -685,10 +785,11 @@ if __name__ == "__main__":
         freeze_encoders(student)
         trainable = sum(p.numel() for p in student.parameters() if p.requires_grad)
         total = sum(p.numel() for p in student.parameters())
-        print(
-            f"LoRA trainable: {trainable:,} / {total:,} "
-            f"({100 * trainable / total:.1f}%)"
-        )
+        if is_main_process:
+            print(
+                f"LoRA trainable: {trainable:,} / {total:,} "
+                f"({100 * trainable / total:.1f}%)"
+            )
     elif args.objective == "consistency_distillation":
         teacher = SAMAudio.from_pretrained(args.model_id)
         teacher = teacher.to(compute_dtype)
@@ -710,16 +811,20 @@ if __name__ == "__main__":
     train_loader = build_dataloader(
         split="train", data_root=args.data_dir,
         batch_size=args.batch_size, num_workers=4,
+        distributed=distributed,
     )
-    print(f"Train dataset: {len(train_loader.dataset)} items")
+    if is_main_process:
+        print(f"Train dataset: {len(train_loader.dataset)} items")
 
     val_loader = None
     if args.val:
         val_loader = build_dataloader(
             split="val", data_root=args.data_dir,
             batch_size=args.batch_size, num_workers=4,
+            distributed=distributed,
         )
-        print(f"Val dataset:   {len(val_loader.dataset)} items")
+        if is_main_process:
+            print(f"Val dataset:   {len(val_loader.dataset)} items")
 
     # ── Train ─────────────────────────────────────────────────────────
     student = turbo_train(
@@ -753,5 +858,9 @@ if __name__ == "__main__":
         gradient_clip_norm=args.gradient_clip_norm,
     )
 
-    print(f"{args.objective} training complete.")
-    print(f"Checkpoints saved to {args.save_dir}/")
+    if is_main_process:
+        print(f"{args.objective} training complete.")
+        print(f"Checkpoints saved to {args.save_dir}/")
+    if distributed:
+        dist.barrier()
+        dist.destroy_process_group()

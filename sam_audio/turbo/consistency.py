@@ -331,6 +331,7 @@ def consistency_loss(
     t: float,
     s: float,
     loss_fn: str = "huber",
+    target_student: nn.Module | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Compute consistency distillation loss for one (t, s) interval.
 
@@ -344,6 +345,8 @@ def consistency_loss(
         t: Noisier time point (e.g. 0.0).
         s: Cleaner time point (e.g. 0.25). Must satisfy ``t < s``.
         loss_fn: ``"mse"``, ``"l1"``, or ``"huber"`` (default).
+        target_student: Optional unwrapped student used only for the stopped
+            EMA target when ``student`` is DDP.
 
     Returns:
         ``(loss, x0_student, x0_target)`` where ``loss`` has gradient
@@ -368,7 +371,8 @@ def consistency_loss(
     with torch.no_grad():
         kwargs = dict(noisy_audio=x_s, time=s_s, **forward_args)
         if isinstance(ema_model, EMAHelper):
-            v_ema = ema_model.forward(student, **kwargs)
+            ema_student = student if target_student is None else target_student
+            v_ema = ema_model.forward(ema_student, **kwargs)
         else:
             v_ema = ema_model(**kwargs)
         x0_target = velocity_to_clean(x_s, s_s, v_ema)

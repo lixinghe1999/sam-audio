@@ -109,6 +109,23 @@ class AlphaFlowLossTest(unittest.TestCase):
         self.assertIsNotNone(self.model.scale.grad)
         self.assertTrue(torch.isfinite(self.model.scale.grad))
 
+    def test_separate_target_model_is_used_for_ddp_safe_bootstrap(self) -> None:
+        target_model = ToyVelocityModel()
+        loss, _, _ = _MEANFLOW.alphaflow_loss(
+            student=self.model,
+            target_student=target_model,
+            clean=self.clean,
+            noise=self.noise,
+            forward_args={},
+            t=self.t,
+            s=self.s,
+            alpha=0.5,
+            adaptive_p=0.0,
+        )
+        loss.backward()
+        self.assertIsNotNone(self.model.scale.grad)
+        self.assertIsNone(target_model.scale.grad)
+
     def test_adaptive_alpha_weight_matches_meanflow_tse(self) -> None:
         alpha = 0.5
         eps = 1e-3
