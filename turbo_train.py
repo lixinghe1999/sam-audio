@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import argparse
 from contextlib import nullcontext
+import gc
 import os
 import time
 
@@ -73,6 +74,21 @@ def _distributed_average(
     if dist.is_available() and dist.is_initialized():
         dist.all_reduce(values, op=dist.ReduceOp.SUM)
     return (values[0] / values[1].clamp_min(1)).item()
+
+
+def _release_host_memory() -> None:
+    """Return large temporary checkpoint allocations to the host OS."""
+    gc.collect()
+    if os.name == "posix":
+        try:
+            import ctypes
+
+            libc = ctypes.CDLL(None)
+            malloc_trim = getattr(libc, "malloc_trim", None)
+            if malloc_trim is not None:
+                malloc_trim(0)
+        except (OSError, AttributeError):
+            pass
 
 
 def _checkpoint_state_dict(
@@ -776,33 +792,50 @@ if __name__ == "__main__":
         )
 
     # ── Load model(s) ─────────────────────────────────────────────────
-    teacher = None
-    if args.use_lora:
-        student = SAMAudio.from_pretrained(args.model_id)
-        student = student.to(compute_dtype)
-        strip_vision_branch(student)
-        student = apply_lora(student, rank=args.lora_rank, alpha=16)
-        freeze_encoders(student)
-        trainable = sum(p.numel() for p in student.parameters() if p.requires_grad)
-        total = sum(p.numel() for p in student.parameters())
-        if is_main_process:
-            print(
-                f"LoRA trainable: {trainable:,} / {total:,} "
-                f"({100 * trainable / total:.1f}%)"
-            )
-    elif args.objective == "consistency_distillation":
-        teacher = SAMAudio.from_pretrained(args.model_id)
-        teacher = teacher.to(compute_dtype)
-        strip_vision_branch(teacher)
+    # Loading the 2.4B-parameter checkpoint creates a large temporary FP32
+    # state dict. Under torchrun, concurrent rank initialization can exhaust
+    # host RAM even though the final per-GPU BF16 models fit. Load one local
+    # rank at a time and move its pruned model to the target GPU before the
+    # next rank starts.
+    load_slots = world_size if distributed else 1
+    for load_rank in range(load_slots):
+        if not distributed or dist.get_rank() == load_rank:
+            teacher = None
+            if args.use_lora:
+                student = SAMAudio.from_pretrained(args.model_id)
+                strip_vision_branch(student)
+                student = student.to(device=device, dtype=compute_dtype)
+                student = apply_lora(student, rank=args.lora_rank, alpha=16)
+                freeze_encoders(student)
+                trainable = sum(
+                    p.numel() for p in student.parameters() if p.requires_grad
+                )
+                total = sum(p.numel() for p in student.parameters())
+                if is_main_process:
+                    print(
+                        f"LoRA trainable: {trainable:,} / {total:,} "
+                        f"({100 * trainable / total:.1f}%)"
+                    )
+            elif args.objective == "consistency_distillation":
+                teacher = SAMAudio.from_pretrained(args.model_id)
+                strip_vision_branch(teacher)
+                teacher = teacher.to(device=device, dtype=compute_dtype)
 
-        # Keep full-weight student parameters in FP32. turbo_train uses BF16
-        # autocast for forward/backward compute without sacrificing updates.
-        student = SAMAudio.from_pretrained(args.model_id)
-        strip_vision_branch(student)
-    else:
-        # MeanFlow/AlphaFlow need neither an external teacher nor an EMA model.
-        student = SAMAudio.from_pretrained(args.model_id)
-        strip_vision_branch(student)
+                # Keep full-weight student parameters in FP32. turbo_train
+                # uses BF16 autocast without sacrificing optimizer updates.
+                student = SAMAudio.from_pretrained(args.model_id)
+                strip_vision_branch(student)
+                student = student.to(device=device, dtype=torch.float32)
+            else:
+                # MeanFlow/AlphaFlow need no external teacher or EMA model.
+                student = SAMAudio.from_pretrained(args.model_id)
+                strip_vision_branch(student)
+                student = student.to(device=device, dtype=torch.float32)
+            # Release the temporary checkpoint/state-dict objects before the
+            # next rank begins its host-memory-heavy initialization.
+            _release_host_memory()
+        if distributed:
+            dist.barrier()
 
     # ── Processor ─────────────────────────────────────────────────────
     processor = SAMAudioProcessor.from_pretrained(args.model_id)
