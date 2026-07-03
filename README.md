@@ -136,18 +136,40 @@ recommended for the lowest persistent GPU-memory use.
 # Consistency distillation
 python turbo_train.py --objective consistency_distillation --use-lora --num-steps 4
 
-# MeanFlow (simulation-free, no teacher or EMA model)
+# MeanFlow-TSE-aligned curriculum (default: alpha 1.0 -> 0.005)
 python turbo_train.py --objective meanflow --use-lora
 
-# AlphaFlow through MeanFlow (finite self-distillation)
+# Fixed-alpha AlphaFlow (disables the default curriculum)
 python turbo_train.py --objective meanflow --alpha 0.5 --use-lora
+
+# Custom AlphaFlow curriculum: trajectory FM -> near-MeanFlow without a JVP
+python turbo_train.py --objective meanflow --alpha-start 1.0 --alpha-end 0.01 \
+  --alpha-schedule sigmoid --use-lora
+
+# Exact JVP MeanFlow (available explicitly, but not the stable default recipe)
+python turbo_train.py --objective meanflow --alpha 0 --use-lora
 ```
 
-MeanFlow defaults to the paper's 25% non-zero-interval mixture. Adjust it with
+MeanFlow defaults to MeanFlow-TSE's 50% interval-batch / 50%
+instantaneous-flow-batch mixture. Adjust it with
 `--meanflow-nonzero-ratio`; use `--meanflow-time-distribution uniform` to
 replace the default logit-normal time sampling.
 `--alpha 0` selects the original JVP MeanFlow objective. Values in `(0, 1]`
 enable finite-step AlphaFlow; `--alpha 1` is trajectory flow matching.
+Omitting all alpha options selects the default `1.0 -> 0.005` sigmoid
+curriculum. For a custom curriculum, provide `--alpha-start` and `--alpha-end`
+together. MeanFlow training also defaults to a `1e-4` learning rate, two-step
+gradient accumulation, and gradient clipping at `0.5`; CD defaults are
+unchanged.
+
+MeanFlow checkpoints require the interval-aware sampler. The regular
+`few_step_separate()` remains the CD inference path:
+
+```python
+from sam_audio.turbo import meanflow_separate
+
+result = meanflow_separate(model, batch, num_steps=1)
+```
 
 ## Evaluation
 

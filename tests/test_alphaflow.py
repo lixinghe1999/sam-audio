@@ -109,6 +109,118 @@ class AlphaFlowLossTest(unittest.TestCase):
         self.assertIsNotNone(self.model.scale.grad)
         self.assertTrue(torch.isfinite(self.model.scale.grad))
 
+    def test_adaptive_alpha_weight_matches_meanflow_tse(self) -> None:
+        alpha = 0.5
+        eps = 1e-3
+        loss, prediction, target = _MEANFLOW.alphaflow_loss(
+            student=self.model,
+            clean=self.clean,
+            noise=self.noise,
+            forward_args={},
+            t=self.t,
+            s=self.s,
+            alpha=alpha,
+            adaptive_p=1.0,
+            adaptive_eps=eps,
+        )
+        delta_sq = (prediction.float() - target.float()).square().flatten(1).mean(1)
+        expected = (
+            alpha / (delta_sq.detach() + eps) * delta_sq
+        ).mean()
+        torch.testing.assert_close(loss, expected)
+
+
+class MeanFlowTimeSamplingTest(unittest.TestCase):
+    def test_instantaneous_samples_use_standard_logistic_normal(self) -> None:
+        torch.manual_seed(0)
+        t, s = _MEANFLOW.sample_meanflow_times(
+            20_000,
+            torch.device("cpu"),
+            nonzero_ratio=0.0,
+            distribution="logit_normal",
+            # This parameter belongs only to interval sampling.
+            logit_mean=8.0,
+        )
+        torch.testing.assert_close(t, s)
+        self.assertAlmostEqual(t.mean().item(), 0.5, delta=0.02)
+
+    def test_interval_samples_are_ordered(self) -> None:
+        torch.manual_seed(1)
+        t, s = _MEANFLOW.sample_meanflow_times(
+            1_000,
+            torch.device("cpu"),
+            nonzero_ratio=1.0,
+            distribution="logit_normal",
+            logit_mean=-0.4,
+        )
+        self.assertTrue(torch.all(t <= s))
+        self.assertTrue(torch.all(s > t))
+
+
+class MeanFlowSamplerTest(unittest.TestCase):
+    def test_sampler_supplies_each_step_interval(self) -> None:
+        calls = []
+
+        class RecordingModel(nn.Module):
+            def forward(
+                self,
+                *,
+                noisy_audio,
+                time,
+                flow_interval,
+                **_kwargs,
+            ):
+                calls.append((time.clone(), flow_interval.clone()))
+                return torch.ones_like(noisy_audio)
+
+        noise = torch.zeros(2, 3, 4)
+        result = _MEANFLOW.meanflow_sample(
+            RecordingModel(),
+            {"audio_features": noise},
+            num_steps=4,
+            noise=noise,
+        )
+        self.assertEqual(len(calls), 4)
+        for index, (time, interval) in enumerate(calls):
+            torch.testing.assert_close(
+                time, torch.full_like(time, index / 4)
+            )
+            torch.testing.assert_close(
+                interval, torch.full_like(interval, 0.25)
+            )
+        torch.testing.assert_close(result, torch.ones_like(noise))
+
+
+class AlphaScheduleTest(unittest.TestCase):
+    def test_linear_schedule_has_warmup_transition_and_hold(self) -> None:
+        values = [
+            _MEANFLOW.scheduled_alpha(
+                step,
+                11,
+                start=1.0,
+                end=0.1,
+                schedule="linear",
+                warmup_ratio=0.1,
+                transition_ratio=0.7,
+            )
+            for step in range(11)
+        ]
+        self.assertEqual(values[0], 1.0)
+        self.assertEqual(values[1], 1.0)
+        self.assertAlmostEqual(values[8], 0.1)
+        self.assertAlmostEqual(values[-1], 0.1)
+        self.assertTrue(all(a >= b for a, b in zip(values, values[1:])))
+
+    def test_sigmoid_schedule_reaches_exact_endpoints(self) -> None:
+        start = _MEANFLOW.scheduled_alpha(
+            0, 11, start=1.0, end=0.01, schedule="sigmoid"
+        )
+        end = _MEANFLOW.scheduled_alpha(
+            10, 11, start=1.0, end=0.01, schedule="sigmoid"
+        )
+        self.assertEqual(start, 1.0)
+        self.assertEqual(end, 0.01)
+
 
 if __name__ == "__main__":
     unittest.main()

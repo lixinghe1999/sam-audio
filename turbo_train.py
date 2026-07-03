@@ -47,6 +47,7 @@ from sam_audio.turbo.consistency import (
 )
 from sam_audio.turbo.meanflow import (
     alphaflow_loss,
+    scheduled_alpha,
     sample_meanflow_times,
 )
 
@@ -85,20 +86,28 @@ def turbo_train(
     objective: str = "consistency_distillation",
     num_steps: int = 4,
     epochs: int = 20,
-    lr: float = 1e-5,
+    lr: float | None = None,
     ema_decay: float = 0.999,
     device: str = "cuda",
     save_dir: str = "turbo-checkpoint",
     log_every: int = 5,
     val_loader: DataLoader | None = None,
     val_every: int = 1,
-    meanflow_nonzero_ratio: float = 0.25,
+    meanflow_nonzero_ratio: float = 0.5,
     meanflow_time_distribution: str = "logit_normal",
-    meanflow_logit_mean: float = 0.4,
+    meanflow_logit_mean: float = -0.4,
     meanflow_logit_std: float = 1.0,
     meanflow_adaptive_p: float = 1.0,
-    meanflow_adaptive_eps: float = 0.01,
-    alpha: float = 0.0,
+    meanflow_adaptive_eps: float = 0.001,
+    alpha: float | None = None,
+    alpha_start: float | None = None,
+    alpha_end: float | None = None,
+    alpha_schedule: str = "sigmoid",
+    alpha_warmup_ratio: float = 0.0,
+    alpha_transition_ratio: float = 1.0,
+    alpha_sigmoid_gamma: float = 25.0,
+    gradient_accumulation_steps: int | None = None,
+    gradient_clip_norm: float | None = None,
 ):
     """Train SAM-Audio with consistency distillation, MeanFlow, or AlphaFlow.
 
@@ -113,23 +122,39 @@ def turbo_train(
         objective: ``"consistency_distillation"`` or ``"meanflow"``.
         num_steps: Number of CD intervals (1 / 2 / 4).
         epochs: Training epochs.
-        lr: Learning rate for student (single optimizer, no discriminator).
+        lr: Learning rate. Defaults to ``1e-5`` for CD and ``1e-4`` for
+            MeanFlow/AlphaFlow.
         ema_decay: EMA decay rate for target student.
         device: Training device.
         save_dir: Checkpoint directory.
         log_every: Log metrics every N steps.
         val_loader: Optional DataLoader for validation after each epoch.
         val_every: Validate every N epochs (default 1).
-        meanflow_nonzero_ratio: Fraction of MeanFlow samples with ``s != t``.
-            Remaining samples train the instantaneous velocity at ``s=t``.
+        meanflow_nonzero_ratio: Probability that a MeanFlow batch uses
+            ``s != t``. Remaining batches train instantaneous velocity at
+            ``s=t``.
         meanflow_time_distribution: ``"logit_normal"`` or ``"uniform"``.
-        meanflow_logit_mean: Logit-normal mean, adapted to noise-at-zero time.
+        meanflow_logit_mean: Interval logit-normal mean. MeanFlow-TSE uses
+            ``-0.4`` with the shared noise-at-zero time convention.
         meanflow_logit_std: Logit-normal standard deviation.
         meanflow_adaptive_p: Exponent for adaptive MeanFlow loss weighting.
         meanflow_adaptive_eps: Stabilizer for adaptive loss weighting.
-        alpha: MeanFlow/AlphaFlow consistency-step ratio. ``0`` uses the
+        alpha: Fixed MeanFlow/AlphaFlow consistency-step ratio. ``0`` uses the
             original JVP MeanFlow objective; positive values enable finite-step
-            AlphaFlow, with ``1`` reducing to trajectory flow matching.
+            AlphaFlow. When neither a fixed alpha nor curriculum endpoints are
+            supplied, MeanFlow-TSE's ``1.0 -> 0.005`` curriculum is used.
+        alpha_start: Optional curriculum starting alpha. Must be provided with
+            ``alpha_end``; when set, it supersedes the fixed ``alpha``.
+        alpha_end: Optional curriculum final alpha.
+        alpha_schedule: Curriculum transition shape, ``"sigmoid"`` or
+            ``"linear"``.
+        alpha_warmup_ratio: Fraction of training held at ``alpha_start``.
+        alpha_transition_ratio: Fraction annealing from start to end.
+        alpha_sigmoid_gamma: Steepness of the sigmoid transition.
+        gradient_accumulation_steps: Microbatches per optimizer update.
+            Defaults to 1 for CD and 2 for MeanFlow/AlphaFlow.
+        gradient_clip_norm: Maximum gradient norm. Defaults to disabled for CD
+            and 0.5 for MeanFlow/AlphaFlow.
     """
     # ── freeze teacher ──────────────────────────────────────────────
     device = torch.device(device)
@@ -140,6 +165,18 @@ def turbo_train(
             f"objective must be one of {sorted(valid_objectives)}, got {objective!r}"
         )
     use_cd = objective == "consistency_distillation"
+    if lr is None:
+        lr = 1e-5 if use_cd else 1e-4
+    if lr <= 0:
+        raise ValueError("lr must be positive")
+    if gradient_accumulation_steps is None:
+        gradient_accumulation_steps = 1 if use_cd else 2
+    if gradient_accumulation_steps < 1:
+        raise ValueError("gradient_accumulation_steps must be positive")
+    if gradient_clip_norm is None:
+        gradient_clip_norm = 0.0 if use_cd else 0.5
+    if gradient_clip_norm < 0:
+        raise ValueError("gradient_clip_norm must be non-negative")
     if num_steps < 1:
         raise ValueError(f"num_steps must be positive, got {num_steps}")
     if log_every < 1:
@@ -151,8 +188,33 @@ def turbo_train(
             raise ValueError("meanflow_logit_std must be positive")
         if meanflow_adaptive_p < 0 or meanflow_adaptive_eps <= 0:
             raise ValueError("invalid MeanFlow adaptive-weighting parameters")
-        if not 0 <= alpha <= 1:
+        if alpha is None and alpha_start is None and alpha_end is None:
+            alpha_start, alpha_end = 1.0, 0.005
+        if alpha is not None and not 0 <= alpha <= 1:
             raise ValueError("MeanFlow alpha must satisfy 0 <= alpha <= 1")
+        curriculum_enabled = alpha_start is not None or alpha_end is not None
+        if curriculum_enabled:
+            if alpha_start is None or alpha_end is None:
+                raise ValueError("alpha_start and alpha_end must be set together")
+            if alpha is not None:
+                raise ValueError("fixed alpha and alpha curriculum cannot be combined")
+            # Validate all schedule settings before allocating model state.
+            scheduled_alpha(
+                0,
+                2,
+                start=alpha_start,
+                end=alpha_end,
+                schedule=alpha_schedule,
+                warmup_ratio=alpha_warmup_ratio,
+                transition_ratio=alpha_transition_ratio,
+                sigmoid_gamma=alpha_sigmoid_gamma,
+            )
+        else:
+            curriculum_enabled = False
+            if alpha is None:
+                raise ValueError("a fixed alpha or alpha curriculum is required")
+    else:
+        curriculum_enabled = False
 
     if use_cd and teacher is not None:
         teacher.eval()
@@ -213,31 +275,58 @@ def turbo_train(
     ema = EMAHelper(trainable_named, decay=ema_decay) if use_cd else None
 
     # ── optimizer (single, no discriminator) ────────────────────────
+    optimizer_kwargs = {"lr": lr}
+    if use_cd:
+        # Preserve the existing consistency-distillation optimizer recipe.
+        optimizer_kwargs["betas"] = (0.5, 0.9)
     optimizer = torch.optim.AdamW(
-        [param for _, param in trainable_named], lr=lr, betas=(0.5, 0.9)
+        [param for _, param in trainable_named], **optimizer_kwargs
     )
 
     # ── stats ───────────────────────────────────────────────────────
     trainable = sum(p.numel() for p in student.parameters() if p.requires_grad)
     print(f"Student trainable params: {trainable:,}")
     print(f"Training objective:       {objective}")
+    print(f"Learning rate:            {lr}")
     if use_cd:
         print(f"CD intervals:             {num_steps}")
         print(f"EMA decay:                {ema_decay}")
     else:
         print(f"Flow interval ratio:      {meanflow_nonzero_ratio}")
-        flow_method = "MeanFlow" if alpha == 0 else "AlphaFlow"
-        print(f"Flow method:              {flow_method}")
-        print(f"Flow alpha:               {alpha}")
+        print(f"Gradient accumulation:    {gradient_accumulation_steps}")
+        print(f"Gradient clip norm:       {gradient_clip_norm}")
+        if curriculum_enabled:
+            print(f"Alpha curriculum:         {alpha_start} -> {alpha_end}")
+            print(f"Alpha schedule:           {alpha_schedule}")
+        else:
+            flow_method = "MeanFlow" if alpha == 0 else "AlphaFlow"
+            print(f"Flow method:              {flow_method}")
+            print(f"Flow alpha:               {alpha}")
     os.makedirs(save_dir, exist_ok=True)
 
     # ── epoch loop ──────────────────────────────────────────────────
+    steps_per_epoch = len(dataloader)
+    total_train_steps = epochs * steps_per_epoch
+    current_alpha = alpha if alpha is not None else alpha_start
     for epoch in range(epochs):
         epoch_start = time.time()
         losses = []
         pbar = tqdm(dataloader, desc=f"Epoch {epoch+1}/{epochs}")
+        optimizer.zero_grad(set_to_none=True)
 
         for step, batch in enumerate(pbar):
+            if curriculum_enabled:
+                global_step = epoch * steps_per_epoch + step
+                current_alpha = scheduled_alpha(
+                    global_step,
+                    total_train_steps,
+                    start=alpha_start,
+                    end=alpha_end,
+                    schedule=alpha_schedule,
+                    warmup_ratio=alpha_warmup_ratio,
+                    transition_ratio=alpha_transition_ratio,
+                    sigmoid_gamma=alpha_sigmoid_gamma,
+                )
             # --- unpack / encode ---
             if isinstance(batch, tuple):
                 audios, descriptions = batch
@@ -260,7 +349,6 @@ def turbo_train(
             audio_features = forward_args["audio_features"]  # z_0: clean latent
             z_1 = torch.randn_like(audio_features)  # noise
 
-            optimizer.zero_grad(set_to_none=True)
             with torch.autocast(
                 device_type=device.type,
                 dtype=torch.bfloat16,
@@ -302,21 +390,37 @@ def turbo_train(
                         forward_args=forward_args,
                         t=t,
                         s=s,
-                        alpha=alpha,
+                        alpha=current_alpha,
                         adaptive_p=meanflow_adaptive_p,
                         adaptive_eps=meanflow_adaptive_eps,
                     )
 
-            loss.backward()
-            optimizer.step()
+            (loss / gradient_accumulation_steps).backward()
+            should_step = (
+                (step + 1) % gradient_accumulation_steps == 0
+                or step + 1 == steps_per_epoch
+            )
+            if should_step:
+                if gradient_clip_norm > 0:
+                    torch.nn.utils.clip_grad_norm_(
+                        [param for _, param in trainable_named],
+                        gradient_clip_norm,
+                    )
+                optimizer.step()
+                optimizer.zero_grad(set_to_none=True)
 
-            # --- update EMA ---
-            if ema is not None:
-                ema.update()
+                # --- update EMA once per optimizer update ---
+                if ema is not None:
+                    ema.update()
 
             # --- logging ---
             losses.append(loss.item())
-            pbar.set_postfix(loss=f"{losses[-1]:.6f}")
+            if use_cd:
+                pbar.set_postfix(loss=f"{losses[-1]:.6f}")
+            else:
+                pbar.set_postfix(
+                    loss=f"{losses[-1]:.6f}", alpha=f"{current_alpha:.4f}"
+                )
 
         # --- epoch summary ---
         elapsed = time.time() - epoch_start
@@ -354,7 +458,16 @@ def turbo_train(
                 "logit_std": meanflow_logit_std,
                 "adaptive_p": meanflow_adaptive_p,
                 "adaptive_eps": meanflow_adaptive_eps,
-                "alpha": alpha,
+                "alpha": current_alpha,
+                "alpha_curriculum": {
+                    "enabled": curriculum_enabled,
+                    "start": alpha_start,
+                    "end": alpha_end,
+                    "schedule": alpha_schedule,
+                    "warmup_ratio": alpha_warmup_ratio,
+                    "transition_ratio": alpha_transition_ratio,
+                    "sigmoid_gamma": alpha_sigmoid_gamma,
+                },
             }
         torch.save(state, f"{ckpt_path}/training_state.pt")
         print(f"  -> saved checkpoint to {ckpt_path}")
@@ -425,7 +538,7 @@ def turbo_train(
                             forward_args=forward_args,
                             t=t,
                             s=s,
-                            alpha=alpha,
+                            alpha=current_alpha,
                             adaptive_p=meanflow_adaptive_p,
                             adaptive_eps=meanflow_adaptive_eps,
                         )
@@ -461,30 +574,70 @@ if __name__ == "__main__":
     )
     parser.add_argument("--epochs", type=int, default=20)
     parser.add_argument("--batch-size", type=int, default=1)
-    parser.add_argument("--lr", type=float, default=1e-5, help="Learning rate")
+    parser.add_argument(
+        "--lr",
+        type=float,
+        default=None,
+        help="Learning rate (default: CD 1e-5, MeanFlow 1e-4)",
+    )
     parser.add_argument(
         "--ema-decay", type=float, default=0.999, help="EMA decay for target student"
     )
     parser.add_argument(
         "--meanflow-nonzero-ratio",
         type=float,
-        default=0.25,
-        help="Fraction of MeanFlow samples using a non-zero interval",
+        default=0.5,
+        help="Probability of a MeanFlow batch using a non-zero interval",
     )
     parser.add_argument(
         "--meanflow-time-distribution",
         choices=("logit_normal", "uniform"),
         default="logit_normal",
     )
-    parser.add_argument("--meanflow-logit-mean", type=float, default=0.4)
+    parser.add_argument("--meanflow-logit-mean", type=float, default=-0.4)
     parser.add_argument("--meanflow-logit-std", type=float, default=1.0)
     parser.add_argument("--meanflow-adaptive-p", type=float, default=1.0)
-    parser.add_argument("--meanflow-adaptive-eps", type=float, default=0.01)
+    parser.add_argument("--meanflow-adaptive-eps", type=float, default=0.001)
     parser.add_argument(
         "--alpha",
         type=float,
-        default=0.0,
-        help="0 selects JVP MeanFlow; values in (0, 1] enable AlphaFlow",
+        default=None,
+        help=(
+            "fixed alpha; omitted uses the MeanFlow-TSE 1.0 -> 0.005 "
+            "curriculum"
+        ),
+    )
+    parser.add_argument(
+        "--alpha-start",
+        type=float,
+        default=None,
+        help="Starting curriculum alpha; requires --alpha-end",
+    )
+    parser.add_argument(
+        "--alpha-end",
+        type=float,
+        default=None,
+        help="Final curriculum alpha; requires --alpha-start",
+    )
+    parser.add_argument(
+        "--alpha-schedule",
+        choices=("sigmoid", "linear"),
+        default="sigmoid",
+    )
+    parser.add_argument("--alpha-warmup-ratio", type=float, default=0.0)
+    parser.add_argument("--alpha-transition-ratio", type=float, default=1.0)
+    parser.add_argument("--alpha-sigmoid-gamma", type=float, default=25.0)
+    parser.add_argument(
+        "--gradient-accumulation-steps",
+        type=int,
+        default=None,
+        help="default: CD 1, MeanFlow/AlphaFlow 2",
+    )
+    parser.add_argument(
+        "--gradient-clip-norm",
+        type=float,
+        default=None,
+        help="default: disabled for CD, 0.5 for MeanFlow/AlphaFlow",
     )
     parser.add_argument(
         "--use-lora",
@@ -592,6 +745,14 @@ if __name__ == "__main__":
         meanflow_adaptive_p=args.meanflow_adaptive_p,
         meanflow_adaptive_eps=args.meanflow_adaptive_eps,
         alpha=args.alpha,
+        alpha_start=args.alpha_start,
+        alpha_end=args.alpha_end,
+        alpha_schedule=args.alpha_schedule,
+        alpha_warmup_ratio=args.alpha_warmup_ratio,
+        alpha_transition_ratio=args.alpha_transition_ratio,
+        alpha_sigmoid_gamma=args.alpha_sigmoid_gamma,
+        gradient_accumulation_steps=args.gradient_accumulation_steps,
+        gradient_clip_norm=args.gradient_clip_norm,
     )
 
     print(f"{args.objective} training complete.")

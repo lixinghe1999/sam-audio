@@ -19,6 +19,8 @@ from sam_audio.turbo.meanflow import (
     alphaflow_loss,
     meanflow_loss,
     meanflow_sample,
+    meanflow_separate,
+    scheduled_alpha,
     sample_meanflow_times,
 )
 
@@ -34,5 +36,7 @@ __all__ = [
     "alphaflow_loss",
     "meanflow_loss",
     "meanflow_sample",
+    "meanflow_separate",
+    "scheduled_alpha",
     "sample_meanflow_times",
 ]
