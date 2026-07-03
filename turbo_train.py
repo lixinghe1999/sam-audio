@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
-"""Few-step SAM-Audio training with consistency distillation or MeanFlow.
+"""Few-step SAM-Audio training with CD, MeanFlow, or AlphaFlow.
 
 Consistency distillation uses teacher ODE segments and an EMA target.
 MeanFlow is simulation-free: it learns interval-average velocity using the
 MeanFlow identity and a no-grad Jacobian-vector product (JVP).
+AlphaFlow uses a finite self-distillation step controlled by alpha, avoiding
+the JVP for alpha > 0.
 
 Usage:
     # Full-weight distillation (4-step student)
@@ -12,8 +14,11 @@ Usage:
     # LoRA-based distillation (smaller GPU footprint)
     python turbo_train.py --num-steps 4 --use-lora --lora-rank 8
 
-    # MeanFlow (one-step objective; no teacher or EMA)
+    # MeanFlow (alpha=0: JVP objective; no teacher or EMA)
     python turbo_train.py --objective meanflow --use-lora --epochs 20
+
+    # Enable finite-step AlphaFlow through the same MeanFlow objective
+    python turbo_train.py --objective meanflow --alpha 0.5 --use-lora
 """
 
 from __future__ import annotations
@@ -40,10 +45,35 @@ from sam_audio.turbo.consistency import (
     consistency_loss,
     _make_vf_fn,
 )
-from sam_audio.turbo.meanflow import meanflow_loss, sample_meanflow_times
+from sam_audio.turbo.meanflow import (
+    alphaflow_loss,
+    sample_meanflow_times,
+)
 
 
 # ── training loop ────────────────────────────────────────────────────────
+
+
+def _checkpoint_state_dict(
+    student: nn.Module,
+    ema: EMAHelper | None,
+) -> dict[str, torch.Tensor]:
+    """Build directly loadable weights, substituting EMA parameters for CD."""
+    state_dict = student.state_dict()
+    if ema is None:
+        return state_dict
+    if ema.names is None:
+        raise RuntimeError("named EMA parameters are required for checkpointing")
+
+    missing = [name for name in ema.names if name not in state_dict]
+    if missing:
+        raise RuntimeError(
+            "EMA parameters are missing from the student state dict: "
+            + ", ".join(missing[:3])
+        )
+    for name, shadow in zip(ema.names, ema.shadows):
+        state_dict[name] = shadow.detach()
+    return state_dict
 
 
 def turbo_train(
@@ -68,8 +98,9 @@ def turbo_train(
     meanflow_logit_std: float = 1.0,
     meanflow_adaptive_p: float = 1.0,
     meanflow_adaptive_eps: float = 0.01,
+    alpha: float = 0.0,
 ):
-    """Train SAM-Audio with consistency distillation or MeanFlow.
+    """Train SAM-Audio with consistency distillation, MeanFlow, or AlphaFlow.
 
     Args:
         student: Trainable student SAM-Audio (may be PeftModel).
@@ -78,7 +109,7 @@ def turbo_train(
         teacher: Frozen teacher SAM-Audio. When ``None`` (LoRA mode), the
             student's adapters are disabled for teacher calls, so the frozen
             pretrained base supplies the CD teacher without a second model copy.
-            MeanFlow does not use a teacher.
+            MeanFlow and AlphaFlow do not use a teacher.
         objective: ``"consistency_distillation"`` or ``"meanflow"``.
         num_steps: Number of CD intervals (1 / 2 / 4).
         epochs: Training epochs.
@@ -96,6 +127,9 @@ def turbo_train(
         meanflow_logit_std: Logit-normal standard deviation.
         meanflow_adaptive_p: Exponent for adaptive MeanFlow loss weighting.
         meanflow_adaptive_eps: Stabilizer for adaptive loss weighting.
+        alpha: MeanFlow/AlphaFlow consistency-step ratio. ``0`` uses the
+            original JVP MeanFlow objective; positive values enable finite-step
+            AlphaFlow, with ``1`` reducing to trajectory flow matching.
     """
     # ── freeze teacher ──────────────────────────────────────────────
     device = torch.device(device)
@@ -117,6 +151,8 @@ def turbo_train(
             raise ValueError("meanflow_logit_std must be positive")
         if meanflow_adaptive_p < 0 or meanflow_adaptive_eps <= 0:
             raise ValueError("invalid MeanFlow adaptive-weighting parameters")
+        if not 0 <= alpha <= 1:
+            raise ValueError("MeanFlow alpha must satisfy 0 <= alpha <= 1")
 
     if use_cd and teacher is not None:
         teacher.eval()
@@ -125,7 +161,14 @@ def turbo_train(
             p.requires_grad = False
 
     # ── setup student ───────────────────────────────────────────────
-    student.to(device)
+    # Full-weight mixed-precision training keeps FP32 master parameters and
+    # relies on autocast for BF16 compute. Updating BF16 parameters directly
+    # can round away small optimizer steps. LoRA retains its low-precision,
+    # frozen base while PEFT keeps trainable adapters in a suitable dtype.
+    if hasattr(student, "peft_config"):
+        student.to(device)
+    else:
+        student.to(device=device, dtype=torch.float32)
     student.train()
     freeze_encoders(student)
 
@@ -154,7 +197,7 @@ def turbo_train(
             )
         teacher = student
 
-    # MeanFlow's JVP must see the same deterministic function as its ordinary
+    # Flow self-targets must see the same deterministic function as the online
     # prediction. Gradients still work in eval mode, while dropout is disabled.
     if not use_cd:
         student.eval()
@@ -182,7 +225,10 @@ def turbo_train(
         print(f"CD intervals:             {num_steps}")
         print(f"EMA decay:                {ema_decay}")
     else:
-        print(f"MeanFlow interval ratio:  {meanflow_nonzero_ratio}")
+        print(f"Flow interval ratio:      {meanflow_nonzero_ratio}")
+        flow_method = "MeanFlow" if alpha == 0 else "AlphaFlow"
+        print(f"Flow method:              {flow_method}")
+        print(f"Flow alpha:               {alpha}")
     os.makedirs(save_dir, exist_ok=True)
 
     # ── epoch loop ──────────────────────────────────────────────────
@@ -249,13 +295,14 @@ def turbo_train(
                         logit_mean=meanflow_logit_mean,
                         logit_std=meanflow_logit_std,
                     )
-                    loss, _, _ = meanflow_loss(
+                    loss, _, _ = alphaflow_loss(
                         student=student,
                         clean=audio_features,
                         noise=z_1,
                         forward_args=forward_args,
                         t=t,
                         s=s,
+                        alpha=alpha,
                         adaptive_p=meanflow_adaptive_p,
                         adaptive_eps=meanflow_adaptive_eps,
                     )
@@ -284,16 +331,18 @@ def turbo_train(
 
         # --- checkpoint ---
         ckpt_path = f"{save_dir}/epoch-{epoch + 1}"
+        checkpoint_weights = _checkpoint_state_dict(student, ema)
         if hasattr(student, "save_pretrained"):
-            student.save_pretrained(ckpt_path)
+            student.save_pretrained(ckpt_path, state_dict=checkpoint_weights)
         else:
             os.makedirs(ckpt_path, exist_ok=True)
-            torch.save(student.state_dict(), f"{ckpt_path}/model.pt")
+            torch.save(checkpoint_weights, f"{ckpt_path}/model.pt")
         state = {
             "objective": objective,
             "optimizer": optimizer.state_dict(),
             "epoch": epoch + 1,
             "num_steps": num_steps,
+            "saved_model_weights": "ema" if ema is not None else "online",
         }
         if ema is not None:
             state["ema"] = ema.state_dict()
@@ -305,6 +354,7 @@ def turbo_train(
                 "logit_std": meanflow_logit_std,
                 "adaptive_p": meanflow_adaptive_p,
                 "adaptive_eps": meanflow_adaptive_eps,
+                "alpha": alpha,
             }
         torch.save(state, f"{ckpt_path}/training_state.pt")
         print(f"  -> saved checkpoint to {ckpt_path}")
@@ -334,7 +384,7 @@ def turbo_train(
                 audio_features = forward_args["audio_features"]
                 z_1 = torch.randn_like(audio_features)
 
-                with torch.autocast(
+                with torch.no_grad(), torch.autocast(
                     device_type=device.type,
                     dtype=torch.bfloat16,
                     enabled=amp_enabled,
@@ -368,13 +418,14 @@ def turbo_train(
                             logit_mean=meanflow_logit_mean,
                             logit_std=meanflow_logit_std,
                         )
-                        loss, _, _ = meanflow_loss(
+                        loss, _, _ = alphaflow_loss(
                             student=student,
                             clean=audio_features,
                             noise=z_1,
                             forward_args=forward_args,
                             t=t,
                             s=s,
+                            alpha=alpha,
                             adaptive_p=meanflow_adaptive_p,
                             adaptive_eps=meanflow_adaptive_eps,
                         )
@@ -430,6 +481,12 @@ if __name__ == "__main__":
     parser.add_argument("--meanflow-adaptive-p", type=float, default=1.0)
     parser.add_argument("--meanflow-adaptive-eps", type=float, default=0.01)
     parser.add_argument(
+        "--alpha",
+        type=float,
+        default=0.0,
+        help="0 selects JVP MeanFlow; values in (0, 1] enable AlphaFlow",
+    )
+    parser.add_argument(
         "--use-lora",
         action="store_true",
         help="Apply LoRA to student for smaller GPU footprint",
@@ -460,7 +517,7 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     device = args.device if torch.cuda.is_available() else "cpu"
-    model_dtype = torch.bfloat16 if device != "cpu" else torch.float32
+    compute_dtype = torch.bfloat16 if device != "cpu" else torch.float32
     print(f"Device: {device}")
     print(
         f"Mode: {'LoRA' if args.use_lora else 'full-weight'} "
@@ -471,7 +528,7 @@ if __name__ == "__main__":
     teacher = None
     if args.use_lora:
         student = SAMAudio.from_pretrained(args.model_id)
-        student = student.to(model_dtype)
+        student = student.to(compute_dtype)
         strip_vision_branch(student)
         student = apply_lora(student, rank=args.lora_rank, alpha=16)
         freeze_encoders(student)
@@ -483,16 +540,16 @@ if __name__ == "__main__":
         )
     elif args.objective == "consistency_distillation":
         teacher = SAMAudio.from_pretrained(args.model_id)
-        teacher = teacher.to(model_dtype)
+        teacher = teacher.to(compute_dtype)
         strip_vision_branch(teacher)
 
+        # Keep full-weight student parameters in FP32. turbo_train uses BF16
+        # autocast for forward/backward compute without sacrificing updates.
         student = SAMAudio.from_pretrained(args.model_id)
-        student = student.to(model_dtype)
         strip_vision_branch(student)
     else:
-        # MeanFlow is simulation-free and needs neither teacher nor EMA model.
+        # MeanFlow/AlphaFlow need neither an external teacher nor an EMA model.
         student = SAMAudio.from_pretrained(args.model_id)
-        student = student.to(model_dtype)
         strip_vision_branch(student)
 
     # ── Processor ─────────────────────────────────────────────────────
@@ -534,6 +591,7 @@ if __name__ == "__main__":
         meanflow_logit_std=args.meanflow_logit_std,
         meanflow_adaptive_p=args.meanflow_adaptive_p,
         meanflow_adaptive_eps=args.meanflow_adaptive_eps,
+        alpha=args.alpha,
     )
 
     print(f"{args.objective} training complete.")

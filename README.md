@@ -128,8 +128,9 @@ We additional release another variant (in each size) that is better specifically
 
 ## Turbo Training
 
-`turbo_train.py` supports both consistency distillation (the default) and
-MeanFlow. LoRA is recommended for the lowest persistent GPU-memory use.
+`turbo_train.py` supports consistency distillation (the default) and MeanFlow.
+Positive MeanFlow `alpha` values enable the AlphaFlow target. LoRA is
+recommended for the lowest persistent GPU-memory use.
 
 ```bash
 # Consistency distillation
@@ -137,11 +138,16 @@ python turbo_train.py --objective consistency_distillation --use-lora --num-step
 
 # MeanFlow (simulation-free, no teacher or EMA model)
 python turbo_train.py --objective meanflow --use-lora
+
+# AlphaFlow through MeanFlow (finite self-distillation)
+python turbo_train.py --objective meanflow --alpha 0.5 --use-lora
 ```
 
 MeanFlow defaults to the paper's 25% non-zero-interval mixture. Adjust it with
 `--meanflow-nonzero-ratio`; use `--meanflow-time-distribution uniform` to
 replace the default logit-normal time sampling.
+`--alpha 0` selects the original JVP MeanFlow objective. Values in `(0, 1]`
+enable finite-step AlphaFlow; `--alpha 1` is trajectory flow matching.
 
 ## Evaluation
 

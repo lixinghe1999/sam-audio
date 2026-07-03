@@ -1,9 +1,15 @@
-"""MeanFlow training and sampling for SAM-Audio.
+"""MeanFlow and AlphaFlow training and sampling for SAM-Audio.
 
 SAM-Audio uses the forward convention ``noise @ t=0 -> data @ t=1``.
 For an interval ending at ``s >= t``, the model predicts average velocity
 ``u(z_t, t, h)`` with ``h = s - t``.  In this convention the MeanFlow identity
 is ``u = v + h * D_t u`` while holding the interval endpoint fixed.
+
+AlphaFlow replaces the infinitesimal MeanFlow target with a finite
+self-distillation step controlled by ``alpha``.  In this time convention,
+the intermediate point is ``m = t + alpha * (s - t)``.  ``alpha=1`` is
+trajectory flow matching, while the ``alpha -> 0`` gradient recovers
+MeanFlow; the exact ``alpha=0`` case is evaluated with the MeanFlow JVP.
 """
 
 from __future__ import annotations
@@ -51,7 +57,7 @@ def sample_meanflow_times(
     return t, s
 
 
-def meanflow_loss(
+def alphaflow_loss(
     student: nn.Module,
     clean: torch.Tensor,
     noise: torch.Tensor,
@@ -59,15 +65,17 @@ def meanflow_loss(
     t: torch.Tensor,
     s: torch.Tensor,
     *,
+    alpha: float,
     adaptive_p: float = 1.0,
     adaptive_eps: float = 0.01,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Compute the MeanFlow identity loss using a memory-conscious JVP.
+    """Compute the AlphaFlow loss, including exact MeanFlow at ``alpha=0``.
 
-    The prediction carrying parameter gradients is evaluated normally.  The
-    Jacobian-vector product used to build the stopped target is evaluated
-    separately under ``no_grad``, as recommended by the official PyTorch
-    implementation when compilation is unavailable.
+    For ``alpha > 0``, the full-interval average velocity is trained against
+    a weighted composition of the empirical velocity over the first part of
+    the interval and a stopped model prediction over the remainder.  This is
+    JVP-free.  At ``alpha=0``, the finite difference becomes degenerate, so
+    the exact MeanFlow JVP target is used instead.
     """
     if t.shape != s.shape or t.ndim != 1 or t.size(0) != clean.size(0):
         raise ValueError("t and s must be [batch] tensors")
@@ -77,6 +85,8 @@ def meanflow_loss(
         raise ValueError("adaptive_p must be non-negative")
     if adaptive_eps <= 0:
         raise ValueError("adaptive_eps must be positive")
+    if not 0 <= alpha <= 1:
+        raise ValueError("alpha must be between 0 and 1")
 
     h = s - t
     velocity = clean - noise
@@ -95,25 +105,73 @@ def meanflow_loss(
             **forward_args,
         )
 
-    # Keep the parameter-gradient path independent from the JVP target path.
+    # Keep the parameter-gradient path independent from the stopped target.
     u_pred = u_fn(z_t, t, h)
     with torch.no_grad():
-        from torch.func import jvp
+        if alpha == 0:
+            from torch.func import jvp
 
-        # s is fixed along the derivative, hence d(s-t)/dt = -1.
-        _, du_dt = jvp(
-            u_fn,
-            (z_t, t, h),
-            (velocity, torch.ones_like(t), -torch.ones_like(h)),
-        )
-        h_view = h.reshape((-1,) + (1,) * (clean.ndim - 1))
-        target = velocity + h_view * du_dt
+            # s is fixed along the derivative, hence d(s-t)/dt = -1.
+            _, du_dt = jvp(
+                u_fn,
+                (z_t, t, h),
+                (velocity, torch.ones_like(t), -torch.ones_like(h)),
+            )
+            h_view = h.reshape((-1,) + (1,) * (clean.ndim - 1))
+            target = velocity + h_view * du_dt
+        elif alpha == 1:
+            # The intermediate point is the endpoint, so AlphaFlow reduces
+            # exactly to trajectory flow matching.
+            target = velocity
+        else:
+            first_h = alpha * h
+            first_h_view = first_h.reshape(
+                (-1,) + (1,) * (clean.ndim - 1)
+            )
+            intermediate_t = t + first_h
+            intermediate_z = z_t + first_h_view * velocity
+            remaining_h = s - intermediate_t
+            remaining_u = u_fn(
+                intermediate_z,
+                intermediate_t,
+                remaining_h,
+            )
+            target = alpha * velocity + (1 - alpha) * remaining_u
 
     per_sample = (u_pred.float() - target.float()).square().flatten(1).sum(1)
+    if alpha > 0:
+        # AlphaFlow's 1/alpha normalization preserves a non-vanishing
+        # parameter gradient as the finite consistency step approaches zero.
+        per_sample = per_sample / alpha
     if adaptive_p:
         weight = (per_sample.detach() + adaptive_eps).pow(adaptive_p)
         per_sample = per_sample / weight
     return per_sample.mean(), u_pred, target
+
+
+def meanflow_loss(
+    student: nn.Module,
+    clean: torch.Tensor,
+    noise: torch.Tensor,
+    forward_args: dict[str, Any],
+    t: torch.Tensor,
+    s: torch.Tensor,
+    *,
+    adaptive_p: float = 1.0,
+    adaptive_eps: float = 0.01,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Compute the MeanFlow identity loss using a no-grad JVP target."""
+    return alphaflow_loss(
+        student=student,
+        clean=clean,
+        noise=noise,
+        forward_args=forward_args,
+        t=t,
+        s=s,
+        alpha=0.0,
+        adaptive_p=adaptive_p,
+        adaptive_eps=adaptive_eps,
+    )
 
 
 @torch.inference_mode()
