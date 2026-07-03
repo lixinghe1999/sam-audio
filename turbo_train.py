@@ -259,10 +259,10 @@ def turbo_train(
             )
         teacher = student
 
-    # Flow self-targets must see the same deterministic function as the online
-    # prediction. Gradients still work in eval mode, while dropout is disabled.
-    if not use_cd:
-        student.eval()
+    # Keep the online MeanFlow/AlphaFlow model in training mode, matching
+    # MeanFlow-TSE.  In particular, some PEFT/LoRA versions merge adapters in
+    # eval mode, which can disconnect the prediction from trainable adapter
+    # parameters after a stopped target forward.
 
     # ── EMA student (shadow weights, no optimizer) ──────────────────
     trainable_named = [
@@ -551,8 +551,6 @@ def turbo_train(
 
             # restore training mode
             student.train()
-            if not use_cd:
-                student.eval()
             freeze_encoders(student)
 
     return student

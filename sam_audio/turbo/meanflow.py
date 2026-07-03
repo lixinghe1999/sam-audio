@@ -70,6 +70,21 @@ def scheduled_alpha(
         def sigmoid(value: float) -> float:
             return 1 / (1 + math.exp(-value))
 
+        # MeanFlow-TSE uses an unnormalised sigmoid and clamps both tails:
+        # values above 1-alpha_min become exactly 1 and values below
+        # alpha_min become exactly alpha_min.  Preserve that recipe for its
+        # standard 1 -> alpha_min curriculum instead of entering the finite
+        # AlphaFlow branch on the second optimization step.
+        if start == 1.0 and end > 0:
+            raw_alpha = 1 - sigmoid(
+                sigmoid_gamma * (transition_progress - 0.5)
+            )
+            if raw_alpha > 1 - end:
+                return 1.0
+            if raw_alpha < end:
+                return end
+            return raw_alpha
+
         low = sigmoid(-0.5 * sigmoid_gamma)
         high = sigmoid(0.5 * sigmoid_gamma)
         value = sigmoid(sigmoid_gamma * (transition_progress - 0.5))
@@ -175,12 +190,11 @@ def alphaflow_loss(
             **forward_args,
         )
 
-    # Build the stopped target before the online prediction.  In particular,
-    # the alpha=0 JVP carries primal and tangent intermediates even under
-    # no_grad; computing it while the online backward graph is alive can make
-    # peak memory roughly additive and cause otherwise avoidable OOMs.
-    with torch.no_grad():
-        if alpha == 0:
+    if alpha == 0:
+        # Exact MeanFlow's JVP can be built before the online graph to reduce
+        # peak memory.  Unlike finite AlphaFlow, it does not make a regular
+        # stopped model call that can alter adapter/module runtime state.
+        with torch.no_grad():
             from torch.func import jvp
 
             # s is fixed along the derivative, hence d(s-t)/dt = -1.
@@ -192,29 +206,34 @@ def alphaflow_loss(
             h_view = h.reshape((-1,) + (1,) * (clean.ndim - 1))
             target = velocity + h_view * du_dt
             del primal, du_dt
-        elif alpha == 1:
-            # The intermediate point is the endpoint, so AlphaFlow reduces
-            # exactly to trajectory flow matching.
-            target = velocity
-        else:
-            first_h = alpha * h
-            first_h_view = first_h.reshape(
-                (-1,) + (1,) * (clean.ndim - 1)
-            )
-            intermediate_t = t + first_h
-            intermediate_z = z_t + first_h_view * velocity
-            remaining_h = s - intermediate_t
-            remaining_u = u_fn(
-                intermediate_z,
-                intermediate_t,
-                remaining_h,
-            )
-            target = alpha * velocity + (1 - alpha) * remaining_u
-            del intermediate_z, remaining_u
-
-    # Only now retain the parameter-gradient graph for the online prediction.
-    # The stopped target's JVP/forward intermediates have gone out of scope.
-    u_pred = u_fn(z_t, t, h)
+        u_pred = u_fn(z_t, t, h)
+    else:
+        # Match MeanFlow-TSE's ordering: retain the online graph first, then
+        # construct the stopped bootstrap target.  This is important for LoRA
+        # wrappers whose eval/no-grad forward may update internal adapter
+        # state; a target-first call can disconnect the following prediction
+        # from all trainable parameters.
+        u_pred = u_fn(z_t, t, h)
+        with torch.no_grad():
+            if alpha == 1:
+                # The intermediate point is the endpoint, so AlphaFlow
+                # reduces exactly to trajectory flow matching.
+                target = velocity
+            else:
+                first_h = alpha * h
+                first_h_view = first_h.reshape(
+                    (-1,) + (1,) * (clean.ndim - 1)
+                )
+                intermediate_t = t + first_h
+                intermediate_z = z_t + first_h_view * velocity
+                remaining_h = s - intermediate_t
+                remaining_u = u_fn(
+                    intermediate_z,
+                    intermediate_t,
+                    remaining_h,
+                )
+                target = alpha * velocity + (1 - alpha) * remaining_u
+                del intermediate_z, remaining_u
 
     # MeanFlow-TSE defines the adaptive statistic as a per-sample mean, not a
     # sum, so its stabilizer is independent of latent sequence length.

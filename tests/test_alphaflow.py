@@ -221,6 +221,19 @@ class AlphaScheduleTest(unittest.TestCase):
         self.assertEqual(start, 1.0)
         self.assertEqual(end, 0.01)
 
+    def test_meanflow_tse_sigmoid_clamps_near_one(self) -> None:
+        value = _MEANFLOW.scheduled_alpha(
+            1,
+            1_000,
+            start=1.0,
+            end=0.005,
+            schedule="sigmoid",
+            warmup_ratio=0.0,
+            transition_ratio=1.0,
+            sigmoid_gamma=25.0,
+        )
+        self.assertEqual(value, 1.0)
+
 
 if __name__ == "__main__":
     unittest.main()
